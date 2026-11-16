@@ -1,0 +1,14 @@
+# shingun — challenge workspace (results, worktrees, transcripts)
+workspace/
+
+# runtime/operator config (keys live here; never commit)
+config.json
+.env
+
+# internal engineering docs — not part of the public product
+ARCHITECTURE.md
+QUESTIONS.md
+
+# misc
+*.tmp
+*.log

@@ -1,0 +1,43 @@
+{
+  "port": 8787,
+  "workspace": "./workspace",
+  "profile": "default",
+  "concurrency": { "machineWorkers": 8, "perChallengeWorkers": 6 },
+  "worker": {
+    "maxSteps": 40,
+    "maxTokens": 150000,
+    "wallClockMin": 30,
+    "commandTimeoutSec": 60,
+    "commandOutputCap": 10240,
+    "maxRespawnsPerChallenge": 12
+  },
+  "stall": { "checkIntervalSec": 90, "checksToPrune": 2 },
+  "admission": { "enabled": true, "watermarkMb": 1536, "meminfoPath": "/proc/meminfo", "retryMs": 10000 },
+  "budget": { "perChallengeUsd": 5.00, "perSwarmUsd": 5.00 },
+  "roles": {
+    "master": { "provider": "mistral", "model": null },
+    "worker": { "provider": "mistral", "model": null },
+    "oracle": null
+  },
+  "providers": {
+    "mistral": {
+      "type": "openai-compat",
+      "baseUrl": "https://api.mistral.ai/v1",
+      "apiKeyEnv": "MISTRAL_API_KEY",
+      "defaultModel": "mistral-large-latest",
+      "pricePerMTok": { "in": 0.70, "out": 2.10 }
+    },
+    "mock": {
+      "type": "mock",
+      "fixtureDir": "./test/fixtures/mock",
+      "pricePerMTok": { "in": 0.70, "out": 2.10 }
+    }
+  },
+  "denylist": [
+    "sudo", "su ", "rm -rf /", " shutdown", " reboot", "mkfs",
+    "dd if=/dev/zero of=/dev/", "/etc/shadow"
+  ],
+  "git": { "worktreeBranchPrefix": "shingun/" },
+  "runner": { "useSystemdScope": false, "scopeMemoryMaxMb": 1024 },
+  "scrub": { "envValuesFrom": "./.env" }
+}

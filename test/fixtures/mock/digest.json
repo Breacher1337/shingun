@@ -1,0 +1,8 @@
+{
+  "steps": [
+    {
+      "content": "Siblings report: flag is exposed in README.txt of the repo. Dead ends so far come from failed dynamic approaches.",
+      "usage": { "prompt_tokens": 900, "completion_tokens": 120 }
+    }
+  ]
+}

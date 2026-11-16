@@ -1,0 +1,9 @@
+{
+  "steps": [
+    {
+      "tool_calls": [ { "function": { "name": "status_report", "arguments": {} } } ],
+      "content": "Status reviewed. No action taken beyond the report.",
+      "usage": { "prompt_tokens": 600, "completion_tokens": 80 }
+    }
+  ]
+}

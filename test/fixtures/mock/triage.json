@@ -1,0 +1,8 @@
+{
+  "steps": [
+    {
+      "content": "{\"category\":\"misc\",\"flagFormat\":\"shingun\\\\{[^}]*\\\\}\",\"confidence\":\"high\",\"workerCount\":4,\"personas\":[\"static-analyst\",\"scripter\",\"hypothesis-prover\",\"web-recon\"],\"notes\":\"flag exposed in README\"}",
+      "usage": { "prompt_tokens": 1800, "completion_tokens": 400 }
+    }
+  ]
+}

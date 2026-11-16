@@ -1,0 +1,2 @@
+# intentionally left nearly empty; the challenge lives in README.md
+hello: world

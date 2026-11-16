@@ -1,0 +1,8 @@
+{
+  "steps": [
+    {
+      "content": "{\"persona\":\"hypothesis-prover\",\"strategyPrompt\":\"Prior static reads failed; verify the README hint then act fast on service endpoints if it pans out.\"}",
+      "usage": { "prompt_tokens": 900, "completion_tokens": 90 }
+    }
+  ]
+}
