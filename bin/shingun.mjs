@@ -33,6 +33,7 @@ function usage(code = 1) {
 
 Usage:
   shingun run <repoUrl|localPath> [--challenge-id ID] [--workers N] [--budget-usd X] [--profile P] [--workspace DIR]
+  shingun serve [--port N] [--profile P] [--workspace DIR]
   shingun status [--workspace DIR]
   shingun init-config
   shingun master <swarmId> <directive>
@@ -132,6 +133,35 @@ async function main() {
       if (!swarmId || !workerId || !words.length) usage(1);
       process.stdout.write(JSON.stringify(await orch.steerWorker(swarmId, workerId, words.join(' '))) + '\n');
       process.exit(0);
+      break;
+    }
+    case 'serve': {
+      const { startServer } = await import('../src/server.mjs');
+      const resumed = await orch.resume();
+      const port = typeof args.port === 'string' ? Number(args.port) : config.port;
+      if (!Number.isInteger(port) || port < 0 || port > 65535) {
+        process.stderr.write(`shingun: invalid port ${args.port}\n`);
+        process.exit(1);
+      }
+      const srv = await startServer({
+        config, env, orchestrator: orch, bus, workspaceDir,
+        envFile: path.join(HERE, '.env'),
+        webDir: path.join(HERE, 'web')
+      });
+      await srv.listen(port);
+      process.stdout.write(`shingun (進軍) serving on ${srv.url}\n`);
+      if (srv.tokenGenerated) {
+        process.stdout.write(`generated bearer token and saved it to ${path.join(HERE, '.env')}\n`);
+      }
+      process.stdout.write(`dashboard: ${srv.dashboardUrl}\n`);
+      if (resumed.length) {
+        process.stdout.write(`resumed swarms (in-flight before restart): ${resumed.join(', ')}\n`);
+      }
+      const shutdown = () => {
+        srv.close().finally(() => process.exit(0));
+      };
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
       break;
     }
     default:
