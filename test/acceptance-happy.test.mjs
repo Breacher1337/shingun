@@ -31,3 +31,27 @@ test('acceptance 1: mock swarm solves the fixture repo end to end', async () => 
   assert.match(pm, /shingun\{m0ck_fl4g\}/);
   fs.rm(ws, { recursive: true, force: true }).catch(() => {});
 });
+
+test('acceptance 1b: --flag-format/--category are declared to triage', async () => {
+  const ws = await tmpWorkspace('happy-declared');
+  const { code, events } = await runCli(['run', FIXTURE, '--profile', 'low-power', '--config', TEST_CONFIG,
+    '--flag-format', 'shingun\\{[^}]*\\}', '--category', 'misc', '--workspace', ws]);
+  assert.equal(code, 0, 'clean exit');
+  const tri = events.find((e) => e.type === 'master.triage');
+  assert.ok(tri, 'master.triage event');
+  assert.equal(tri.data.flagFormat.source, 'declared', 'declared beats inferred');
+  assert.equal(tri.data.flagFormat.regex, 'shingun\\{[^}]*\\}', 'declared regex surfaced');
+  const flag = events.find((e) => e.type === 'flag.found');
+  assert.ok(flag, 'flag.found event');
+  assert.equal(flag.data.formatMatch, 'match', 'declared regex validates the flag');
+  fs.rm(ws, { recursive: true, force: true }).catch(() => {});
+});
+
+test('acceptance 1c: invalid --flag-format fails fast', async () => {
+  const ws = await tmpWorkspace('happy-badregex');
+  const { code, stderr } = await runCli(['run', FIXTURE, '--profile', 'low-power', '--config', TEST_CONFIG,
+    '--flag-format', '(', '--workspace', ws]);
+  assert.notEqual(code, 0, 'non-zero exit on bad regex');
+  assert.match(stderr, /invalid --flag-format regex/);
+  fs.rm(ws, { recursive: true, force: true }).catch(() => {});
+});

@@ -32,7 +32,7 @@ function usage(code = 1) {
     `shingun (進軍) — swarm CTF attacks on localhost
 
 Usage:
-  shingun run <repoUrl|localPath> [--challenge-id ID] [--workers N] [--budget-usd X] [--profile P] [--config FILE] [--workspace DIR]
+  shingun run <repoUrl|localPath> [--challenge-id ID] [--workers N] [--budget-usd X] [--flag-format REGEX] [--category C] [--profile P] [--config FILE] [--workspace DIR]
   shingun serve [--port N] [--profile P] [--config FILE] [--workspace DIR]
   shingun status [--workspace DIR]
   shingun init-config
@@ -88,11 +88,20 @@ async function main() {
         source: isUrl ? 'url' : 'path', value: target, challengesDir,
         challengeId: typeof args.challengeId === 'string' ? args.challengeId : undefined
       });
+      // Operator-known challenge metadata: declared values bypass master
+      // inference (triage reports source "declared") and steer personas.
+      let flagFormatRegex = null;
+      if (typeof args.flagFormat === 'string' && args.flagFormat) {
+        try { new RegExp(args.flagFormat); }
+        catch (e) { throw new Error(`invalid --flag-format regex: ${e.message}`); }
+        flagFormatRegex = args.flagFormat;
+      }
+      const categoryHint = typeof args.category === 'string' && args.category ? args.category : null;
       const { swarmId } = await orch.startSwarm({
         challenge: {
           id: ing.challengeId, sourceType: isUrl ? 'url' : 'path', sourceValue: target,
           baseDir: ing.baseDir, fileCount: ing.fileCount, topFiles: ing.topFiles,
-          flagFormatRegex: null, categoryHint: null
+          flagFormatRegex, categoryHint
         },
         opts: {
           workers: typeof args.workers === 'string' ? Number(args.workers) : undefined,
