@@ -46,13 +46,22 @@ export function execCommand(cmd, { cwd, timeoutSec = 60, outputCap = 10240 } = {
 }
 
 function runProcess(cmd, args, { cwd, timeoutSec, outputCap, detached }) {
+  // Commands run machine-in-the-loop: their output feeds worker context and
+  // tests, so it must stay plain regardless of the operator's color env.
+  // FORCE_COLOR/CLICOLOR_FORCE can bleed in and make children emit ANSI even
+  // through pipes; NO_COLOR keeps grandchildren deterministic too.
+  const env = { ...process.env };
+  delete env.FORCE_COLOR;
+  delete env.CLICOLOR_FORCE;
+  env.NO_COLOR = '1';
   return new Promise((resolve) => {
     const started = Date.now();
     const child = spawn(cmd, args, {
       cwd,
       detached,
       windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe']
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env
     });
 
     let out = Buffer.alloc(0);

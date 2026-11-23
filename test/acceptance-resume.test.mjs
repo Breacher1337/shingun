@@ -11,6 +11,7 @@ import { createOrchestrator } from '../src/orchestrator.mjs';
 const HERE = import.meta.dirname;
 const ROOT = path.dirname(HERE);
 const FIXTURE = path.join(ROOT, 'test', 'fixtures', 'challenge-easy');
+const TEST_CONFIG = path.join(ROOT, 'test', 'fixtures', 'test-config.json');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -18,7 +19,7 @@ test('acceptance 6: crash + resume — swarm completes after a hard kill', async
   const ws = await fs.mkdtemp(path.join(os.tmpdir(), 'resume-'));
   const child = spawn(process.execPath, [
     path.join(ROOT, 'bin', 'shingun.mjs'), 'run', FIXTURE,
-    '--profile', 'low-power', '--workspace', ws
+    '--profile', 'low-power', '--config', TEST_CONFIG, '--workspace', ws
   ], { cwd: ROOT, stdio: 'ignore' });
 
   // Watch the events dir until the FIRST durable event lands, then kill hard:
@@ -64,7 +65,7 @@ test('acceptance 6: crash + resume — swarm completes after a hard kill', async
   await sleep(800); // let orphaned tool children notice the dead parent
 
   // Resume: a fresh process-equivalent orchestrator over the same store.
-  const { config, env } = await loadConfig({ file: path.join(ROOT, 'config.json'), profile: 'low-power' });
+  const { config, env } = await loadConfig({ file: TEST_CONFIG, profile: 'low-power' });
   const bus = createBus();
   const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, ws), env, bus });
   const resumed = await orch.resume();

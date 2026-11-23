@@ -1,11 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import { runCli, tmpWorkspace, FIXTURE } from './helpers.mjs';
+
+const TEST_CONFIG = path.join(path.resolve(import.meta.dirname, '..'), 'test', 'fixtures', 'test-config.json');
 
 test('acceptance 1: mock swarm solves the fixture repo end to end', async () => {
   const ws = await tmpWorkspace('happy');
-  const { code, events } = await runCli(['run', FIXTURE, '--profile', 'low-power', '--workspace', ws]);
+  const { code, events } = await runCli(['run', FIXTURE, '--profile', 'low-power', '--config', TEST_CONFIG, '--workspace', ws]);
   assert.equal(code, 0, 'clean exit');
   const types = (t) => events.filter((e) => e.type === t);
   assert.ok(types('challenge.ingested').length >= 1, 'challenge.ingested event');

@@ -146,7 +146,9 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
         memAvailableMb: adm.memAvailableMb, watermarkMb: adm.watermarkMb ?? config.admission.watermarkMb,
         intendingPersona: persona, reason: adm.reason
       }, { worker: wid });
-      await new Promise((r) => setTimeout(r, config.admission.retryMs ?? 10000));
+      // Unref'd: an unadmittable machine must not hold the process (and the
+      // test runner) past the swarm's terminal state purely on retry timing.
+      await new Promise((r) => { const t = setTimeout(r, config.admission.retryMs ?? 10000); t.unref?.(); });
     }
 
     const w = {

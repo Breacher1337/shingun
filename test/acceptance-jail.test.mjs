@@ -41,6 +41,7 @@ test('acceptance 3a: path jail refuses escapes and admits in-root paths', async 
 });
 
 test('acceptance 3b: deny-list refuses, everything else runs', async () => {
+  const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
   const config = structuredClone(DEFAULT_CONFIG);
   const runner = createLocalRunner({ config });
   const r1 = await runner.run('cat /etc/shadow', { cwd: process.cwd() });
@@ -50,7 +51,7 @@ test('acceptance 3b: deny-list refuses, everything else runs', async () => {
   assert.equal(r2.exitCode, 126);
   const r3 = await runner.run('node -e "console.log(1+1)"', { cwd: process.cwd() });
   assert.equal(r3.exitCode, 0);
-  assert.equal(r3.stdout.trim(), '2');
+  assert.equal(stripAnsi(r3.stdout).trim(), '2');
   assert.ok(denylistHit('sudo rm', config.denylist) === 'sudo');
 });
 

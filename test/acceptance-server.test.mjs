@@ -12,11 +12,12 @@ import { tmpWorkspace, NODE, BIN } from './helpers.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const CHALLENGE = path.join(ROOT, 'test', 'fixtures', 'challenge-easy');
+const TEST_CONFIG = path.join(ROOT, 'test', 'fixtures', 'test-config.json');
 const TOKEN = 't-' + 'a'.repeat(40);
 
 async function boot() {
   const ws = await tmpWorkspace('serve-');
-  const { config, env } = await loadConfig({ file: path.join(ROOT, 'config.json'), profile: 'low-power' });
+  const { config, env } = await loadConfig({ file: TEST_CONFIG, profile: 'low-power' });
   const bus = createBus();
   const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, ws), env: { ...env, SHINGUN_TOKEN: TOKEN }, bus });
   const srv = await startServer({
@@ -303,7 +304,7 @@ test('acceptance 2c: command deck round-trip lands as master.chat over SSE', asy
 
 test('acceptance 2d: `shingun serve` boots the real CLI surface', async () => {
   const ws = await tmpWorkspace('clsrv-');
-  const child = spawn(NODE, [BIN, 'serve', '--port', '0', '--workspace', ws], {
+  const child = spawn(NODE, [BIN, 'serve', '--port', '0', '--config', TEST_CONFIG, '--workspace', ws], {
     cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe']
   });
   try {

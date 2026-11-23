@@ -32,8 +32,8 @@ function usage(code = 1) {
     `shingun (進軍) — swarm CTF attacks on localhost
 
 Usage:
-  shingun run <repoUrl|localPath> [--challenge-id ID] [--workers N] [--budget-usd X] [--profile P] [--workspace DIR]
-  shingun serve [--port N] [--profile P] [--workspace DIR]
+  shingun run <repoUrl|localPath> [--challenge-id ID] [--workers N] [--budget-usd X] [--profile P] [--config FILE] [--workspace DIR]
+  shingun serve [--port N] [--profile P] [--config FILE] [--workspace DIR]
   shingun status [--workspace DIR]
   shingun init-config
   shingun master <swarmId> <directive>
@@ -46,8 +46,10 @@ async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const args = parseArgs(rest);
   const profile = typeof args.profile === 'string' ? args.profile : undefined;
+  // --config FILE: load operator config from anywhere instead of <repo>/config.json.
+  const configFile = typeof args.config === 'string' ? path.resolve(args.config) : path.join(HERE, 'config.json');
   const { config, env } = await loadConfig({
-    file: path.join(HERE, 'config.json'),
+    file: configFile,
     profile,
     envFile: path.join(HERE, '.env')
   });
