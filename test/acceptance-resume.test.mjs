@@ -47,15 +47,20 @@ test('acceptance 6: crash + resume — swarm completes after a hard kill', async
   }
   assert.ok(sawFirstEvent, 'swarm started before the crash');
 
-  // Hard kill with tree semantics (taskkill on Windows; SIGKILL is POSIX).
+  // Kill hard and kill NOW. At this point the child has zero live tool
+  // grandchildren (the spawn wave starts post-triage), so a direct
+  // TerminateProcess/SIGKILL on the root is tree-complete. Spawning
+  // taskkill as an intermediary costs ~300ms on Windows — this whole mock
+  // swarm solves in ~0.7s, so an indirect kill can lose the race and turn
+  // the store terminal before resume sees it. Kill inline; follow up with
+  // taskkill /T best-effort for any straggler grandchildren.
+  child.kill('SIGKILL');
   if (process.platform === 'win32' && child.pid) {
     await new Promise((resolve) => {
       const tk = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true });
       tk.on('close', resolve);
       tk.on('error', resolve);
     });
-  } else {
-    child.kill('SIGKILL');
   }
   // Wait for the original process (and its tree) to be fully gone.
   await Promise.race([

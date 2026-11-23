@@ -34,13 +34,18 @@ export async function openEventStore(file, { swarmId } = {}) {
     file,
     append,
     async replay() {
-      const text = await fs.readFile(file, 'utf8');
-      const out = [];
-      for (const line of text.split('\n')) {
-        if (!line.trim()) continue;
-        try { out.push(JSON.parse(line)); } catch { /* skip corrupt tail line */ }
-      }
-      return out;
+      return replayFile(file);
     }
   };
+}
+
+/** Parse a store file into events; corrupt tail lines are skipped. */
+export async function replayFile(file) {
+  const text = await fs.readFile(file, 'utf8');
+  const out = [];
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    try { out.push(JSON.parse(line)); } catch { /* skip corrupt tail line */ }
+  }
+  return out;
 }

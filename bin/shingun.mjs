@@ -1,15 +1,82 @@
 #!/usr/bin/env node
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mkdir } from 'node:fs/promises';
+import fs, { mkdir } from 'node:fs/promises';
 import { loadConfig, resolveWorkspace } from '../src/config.mjs';
 import { createBus } from '../src/bus.mjs';
 import { createOrchestrator } from '../src/orchestrator.mjs';
 import { ingestChallenge } from '../src/ingest.mjs';
+import { replayFile } from '../src/store.mjs';
 
 const HERE = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 const camel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+
+/** Digest a swarm store into a compact status line (CLI status output). */
+async function statusScan(workspaceDir) {
+  const out = [];
+  const challengesDir = path.join(workspaceDir, 'challenges');
+  const entries = await fs.readdir(challengesDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const evDir = path.join(challengesDir, entry.name, 'events');
+    const files = await fs.readdir(evDir).catch(() => []);
+    for (const f of files.filter((x) => x.endsWith('.jsonl'))) {
+      const swarmId = f.replace(/\.jsonl$/, '');
+      const events = await replayFile(path.join(evDir, f)).catch(() => []);
+      if (!events.length) continue;
+      const lastUpdate = [...events].reverse().find((e) => e.type === 'swarm.update');
+      const flags = events.filter((e) => e.type === 'flag.found').map((e) => e.data.flag);
+      const workers = new Map();
+      for (const e of events) {
+        if (!e.worker) continue;
+        const w = workers.get(e.worker) ?? { id: e.worker, persona: null, status: null };
+        if (e.type === 'worker.spawn') w.persona = e.data.persona;
+        if (e.type === 'worker.status') w.status = e.data.status;
+        workers.set(e.worker, w);
+      }
+      const usage = events.filter((e) => e.type === 'usage.tick').reduce((n, e) => n + (Number(e.data.costUsd) || 0), 0);
+      out.push({
+        swarmId,
+        challengeId: entry.name,
+        status: lastUpdate?.data?.final ? lastUpdate.data.status : (lastUpdate?.data?.status ?? 'planning'),
+        final: Boolean(lastUpdate?.data?.final),
+        flags,
+        workers: [...workers.values()],
+        spentUsd: Number(usage.toFixed(5))
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Relay a call to a running `serve` process on localhost. Swarms started by
+ * `serve` live in that process — a fresh CLI reaches them only through the
+ * server's HTTP surface, authenticated with the operator's bearer token.
+ */
+async function serveRelay(method, routePath, body, config, env) {
+  const base = `http://127.0.0.1:${config.port}`;
+  const token = env?.SHINGUN_TOKEN;
+  if (!token) {
+    throw Object.assign(new Error('no running serve process is reachable and no SHINGUN_TOKEN is configured'), { code: 'serve_unreachable' });
+  }
+  let res;
+  try {
+    res = await fetch(base + routePath, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: body !== undefined ? JSON.stringify(body) : undefined
+    });
+  } catch {
+    throw Object.assign(new Error(`no shingun serve process on ${base}`), { code: 'serve_unreachable' });
+  }
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw Object.assign(new Error(payload?.error?.message ?? `serve relay: ${res.status}`), { code: payload?.error?.code ?? 'serve_relay_failed' });
+  }
+  return payload;
+}
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -36,6 +103,7 @@ Usage:
   shingun serve [--port N] [--profile P] [--config FILE] [--workspace DIR]
   shingun status [--workspace DIR]
   shingun init-config
+  shingun bundle <swarmId> [--workspace DIR]
   shingun master <swarmId> <directive>
   shingun steer <swarmId> <workerId> <text>
 `);
@@ -125,24 +193,54 @@ async function main() {
       break;
     }
     case 'status': {
-      for (const sid of orch.emitAll()) {
-        process.stdout.write(JSON.stringify(orch.statusSummary(sid)) + '\n');
+      // Status is a pure read of the workspace stores: a fresh CLI process
+      // has no in-memory swarms, so the event stores on disk ARE the state.
+      for (const line of await statusScan(workspaceDir)) {
+        process.stdout.write(JSON.stringify(line) + '\n');
       }
+      process.exit(0);
+      break;
+    }
+    case 'bundle': {
+      const [swarmId] = args._;
+      if (!swarmId) usage(1);
+      const { buildBundle } = await import('../src/bundle.mjs');
+      const out = await buildBundle({ swarmId, workspaceDir, bus });
+      process.stdout.write(JSON.stringify(out) + '\n');
       process.exit(0);
       break;
     }
     case 'master': {
       const [swarmId, ...words] = args._;
       if (!swarmId || !words.length) usage(1);
-      const res = await orch.directive(swarmId, words.join(' '));
-      process.stdout.write(JSON.stringify(res) + '\n');
+      const text = words.join(' ');
+      try {
+        const res = await orch.directive(swarmId, text);
+        process.stdout.write(JSON.stringify(res) + '\n');
+      } catch (e) {
+        if (e.code !== 'swarm_unknown') throw e;
+        // Not in this process: a running `serve` owns it — relay over HTTP.
+        const out = await serveRelay('POST', '/api/master/message', { swarm: swarmId, text }, config, env);
+        process.stdout.write(JSON.stringify({ ok: out.ok, via: 'serve' }) + '\n');
+      }
       process.exit(0);
       break;
     }
     case 'steer': {
       const [swarmId, workerId, ...words] = args._;
       if (!swarmId || !workerId || !words.length) usage(1);
-      process.stdout.write(JSON.stringify(await orch.steerWorker(swarmId, workerId, words.join(' '))) + '\n');
+      try {
+        const out = await orch.steerWorker(swarmId, workerId, words.join(' '));
+        process.stdout.write(JSON.stringify(out) + '\n');
+      } catch (e) {
+        if (e.code !== 'worker_unknown' && e.code !== 'swarm_unknown') throw e;
+        const out = await serveRelay(
+          'POST',
+          `/api/swarms/${encodeURIComponent(swarmId)}/workers/${encodeURIComponent(workerId)}/message`,
+          { text: words.join(' ') }, config, env
+        );
+        process.stdout.write(JSON.stringify({ ...out, via: 'serve' }) + '\n');
+      }
       process.exit(0);
       break;
     }
