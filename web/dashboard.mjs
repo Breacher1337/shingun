@@ -821,6 +821,73 @@ function openChallengeModal() {
   });
 }
 
+// ---- provider key provisioning ----------------------------------------------
+
+/** Scan providers; surface a quick key card when one is configured but keyless. */
+async function checkProviders() {
+  let info = null;
+  try { info = await api('/api/providers'); } catch { return; /* scan degrades silently */ }
+  hideKeyCard(); // idempotent; re-render with fresh state
+  const missing = new Map(Object.entries(info.providers ?? {})
+    .filter(([, p]) => p.type === 'openai-compat' && !p.hasKey));
+  if (missing.size) showKeyCard(missing, info.roles ?? {});
+}
+
+function hideKeyCard() {
+  $('#key-card')?.remove();
+  if (location.hash === '#api-key') history.replaceState({}, '', location.pathname);
+}
+
+function showKeyCard(missing, roles) {
+  if ($('#key-card')) return;
+  const names = [...missing.keys()];
+  const roleUser = names.includes(roles?.master?.provider) || names.includes(roles?.worker?.provider);
+  const select = h('select', { id: 'kc-prov', class: 'kinput' },
+    names.map((n) => h('option', { value: n, selected: n === names[0] }, n)));
+  const input = h('input', { id: 'kc-key', class: 'kinput', type: 'password',
+    placeholder: missing.get(names[0])?.apiKeyEnv ?? 'API key', autocomplete: 'off', spellcheck: 'false' });
+  const activate = h('input', { id: 'kc-act', type: 'checkbox' });
+  activate.checked = true;
+  const err = h('div', { id: 'kc-err', class: 'kerr' });
+  const card = h('div', { id: 'key-card', class: 'key-card' },
+    h('div', { class: 'key-card-box' },
+      h('h2', {}, `${names.join(' / ')} provider needs an api key`),
+      h('p', { class: 'dim' },
+        roleUser
+          ? 'A role already points at this provider, but its API key is missing — swarms against it cannot run. paste the key to continue.'
+          : 'this provider is configured but has no API key yet. paste one and activate it for the master + worker roles, or keep the keyless mock provider.'),
+      h('label', { class: 'krow' }, 'provider', select),
+      h('label', { class: 'krow' }, 'api key', input),
+      h('label', { class: 'krow kcheck' }, activate, 'use this provider for master + worker'),
+      err,
+      h('div', { class: 'kactions' },
+        h('button', {
+          class: 'kbtn', onclick: async () => {
+            err.replaceChildren();
+            try {
+              const res = await api('/api/provider-key', {
+                method: 'POST',
+                body: { provider: select.value, apiKey: input.value.trim(), activate: activate.checked }
+              });
+              toast(`key saved for ${res.provider}${res.activated ? ' — roles activated' : ''}`, 'flag', 12000);
+              if (res.persisted === false) {
+                toast('warning: key not persisted to .env — it will not survive a restart', 'warn', 15000);
+              }
+              hideKeyCard();
+            } catch (e) {
+              err.replaceChildren(`save failed: ${e.message}`);
+            }
+          }
+        }, 'save key'),
+        h('button', { class: 'kbtn ghost', onclick: hideKeyCard }, roleUser ? 'fix later' : 'keep using mock')
+      )
+    )
+  );
+  document.body.append(card);
+  location.hash = '#api-key';
+  input.focus();
+}
+
 // ---- boot -------------------------------------------------------------------
 
 renderDeckShell();
@@ -836,4 +903,5 @@ if (!TOKEN) {
   if (last) {
     loadSwarm(last).then((ok) => { if (!ok) localStorage.removeItem('shingun.lastSwarm'); });
   }
+  checkProviders();
 }

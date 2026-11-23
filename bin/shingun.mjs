@@ -157,7 +157,8 @@ async function main() {
       const srv = await startServer({
         config, env, orchestrator: orch, bus, workspaceDir,
         envFile: path.join(HERE, '.env'),
-        webDir: path.join(HERE, 'web')
+        webDir: path.join(HERE, 'web'),
+        configFile
       });
       await srv.listen(port);
       process.stdout.write(`shingun (進軍) serving on ${srv.url}\n`);

@@ -23,7 +23,8 @@ async function boot() {
   const srv = await startServer({
     config, env: { ...env, SHINGUN_TOKEN: TOKEN }, orchestrator: orch, bus,
     workspaceDir: ws, envFile: path.join(ws, '.env'),
-    webDir: path.join(ROOT, 'web')
+    webDir: path.join(ROOT, 'web'),
+    configFile: path.join(ws, 'config.json')
   });
   await srv.listen(0);
   const base = `http://127.0.0.1:${srv.server.address().port}`;
@@ -299,6 +300,51 @@ test('acceptance 2c: command deck round-trip lands as master.chat over SSE', asy
     assert.equal(stopUnknown.status, 404);
   } finally {
     await teardown(ctx, swarmId);
+  }
+});
+
+test('acceptance 2e: provider key scan + provisioning (values never echo)', async () => {
+  const ctx = await boot();
+  try {
+    // Scan: metadata + booleans only — never key values.
+    const scan = await ctx.call('/api/providers');
+    assert.equal(scan.status, 200);
+    assert.ok(scan.body.providers.mistral, 'mistral listed');
+    assert.equal(scan.body.providers.mistral.type, 'openai-compat');
+    assert.equal(scan.body.providers.mistral.apiKeyEnv, 'MISTRAL_API_KEY');
+    assert.equal(scan.body.providers.mock.hasKey, null, 'mock is keyless by design');
+    assert.ok(typeof scan.body.providers.mistral.hasKey === 'boolean', 'hasKey is a boolean');
+
+    // Validation: weak keys and unknown providers are refused.
+    const bad = await ctx.call('/api/provider-key', { method: 'POST', body: { provider: 'mistral', apiKey: 'short' } });
+    assert.equal(bad.status, 400, 'weak key refused');
+    const unknown = await ctx.call('/api/provider-key', { method: 'POST', body: { provider: 'void', apiKey: 'x'.repeat(12) } });
+    assert.equal(unknown.status, 400, 'unknown provider refused');
+    const noKeyProvider = await ctx.call('/api/provider-key', { method: 'POST', body: { provider: 'mock', apiKey: 'x'.repeat(12) } });
+    assert.equal(noKeyProvider.status, 400, 'keyless provider refused');
+
+    // Provision: live env, durable .env, role activation, persisted config.
+    const KEY = 'sk-provision-0123456789abcdef';
+    const ok = await ctx.call('/api/provider-key', { method: 'POST', body: { provider: 'mistral', apiKey: KEY, activate: true } });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.ok, true);
+    assert.equal(ok.body.hasKey, true);
+    assert.equal(ok.body.activated, true);
+    assert.equal(ok.body.persisted, true);
+    assert.ok(!JSON.stringify(ok.body).includes(KEY), 'response never echoes the key');
+
+    const after = await ctx.call('/api/providers');
+    assert.equal(after.body.providers.mistral.hasKey, true, 'key visible as boolean');
+    assert.equal(after.body.roles.master.provider, 'mistral', 'master role activated');
+    assert.equal(after.body.roles.worker.provider, 'mistral', 'worker role activated');
+    assert.ok(!JSON.stringify(after.body).includes(KEY), 'scan never leaks the key');
+
+    const envText = await fs.readFile(path.join(ctx.ws, '.env'), 'utf8');
+    assert.match(envText, new RegExp(`^MISTRAL_API_KEY=${KEY}$`, 'm'), 'key persisted to .env');
+    const cfgText = await fs.readFile(path.join(ctx.ws, 'config.json'), 'utf8');
+    assert.match(cfgText, /"provider"\s*:\s*"mistral"/, 'roles persisted to config file');
+  } finally {
+    await teardown(ctx);
   }
 });
 

@@ -252,3 +252,40 @@ input, select, textarea { font: inherit; }
 ::-webkit-scrollbar-thumb { background: #1d232b; border-radius: 6px; }
 ::-webkit-scrollbar-thumb:hover { background: #2a313b; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* provider key provisioning card */
+.key-card {
+  position: fixed; inset: 0; z-index: 60;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(11, 13, 16, 0.88);
+}
+.key-card-box {
+  width: min(460px, calc(100vw - 32px));
+  background: var(--panel);
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  padding: 18px 20px 16px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.key-card-box h2 { margin: 0 0 6px; font-size: 14px; letter-spacing: 0.04em; }
+.key-card-box .dim { color: var(--dim); margin: 0 0 14px; font-size: 12.5px; line-height: 1.55; }
+.krow {
+  display: grid; grid-template-columns: 74px 1fr; gap: 8px; align-items: center;
+  margin: 8px 0; font-size: 12px; color: var(--dim); text-transform: lowercase;
+}
+.krow.kcheck { grid-template-columns: auto 1fr; }
+.kinput {
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 8px 10px; font-family: var(--mono); font-size: 12.5px;
+  outline: none; width: 100%;
+}
+.kinput:focus { border-color: var(--accent); }
+.kcheck input { accent-color: var(--accent); }
+.kactions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+.kbtn {
+  background: var(--accent); border: 1px solid var(--accent); color: #fff;
+  border-radius: 6px; padding: 7px 14px; font-size: 12.5px; cursor: pointer;
+}
+.kbtn:hover { filter: brightness(1.12); }
+.kbtn.ghost { background: transparent; border-color: var(--line-2); color: var(--dim); }
+.kerr { color: var(--c-stall); font-size: 12px; min-height: 16px; margin-top: 6px; }

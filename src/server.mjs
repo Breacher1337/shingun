@@ -67,10 +67,44 @@ export async function startServer({
   bus,
   workspaceDir,
   webDir,
-  envFile = null
+  envFile = null,
+  configFile = null
 }) {
   const challengesDir = path.join(workspaceDir, 'challenges');
   await fs.mkdir(challengesDir, { recursive: true });
+
+  /** Upsert NAME=value in a .env-style file. False only when the write fails. */
+  async function upsertEnvValue(file, name, value) {
+    try {
+      let text = '';
+      try { text = await fs.readFile(file, 'utf8'); } catch { /* absent is fine */ }
+      const re = new RegExp(`^\\s*${name}=.*$`, 'm');
+      const out = re.test(text)
+        ? text.replace(re, `${name}=${value}`)
+        : `${text}${text && !text.endsWith('\n') ? '\n' : ''}${name}=${value}\n`;
+      await fs.writeFile(file, out, 'utf8');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Apply `mutate` to the parsed operator config and write it back.
+   * False on any read/write failure (config stays operator-owned).
+   */
+  async function persistConfigMutation(file, mutate) {
+    try {
+      const cur = await fs.readFile(file, 'utf8')
+        .then((t) => JSON.parse(t))
+        .catch(() => ({}));
+      mutate(cur);
+      await writeJson(file, cur);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   // Gate credential: from .env, or generated (and persisted) on first serve.
   let token = env?.SHINGUN_TOKEN;
@@ -364,6 +398,61 @@ button{margin-top:10px;width:100%;padding:8px;border:0;border-radius:4px;backgro
     }
 
     const segments = pathname.slice('/api/'.length).split('/').map(decodeURIComponent);
+
+    // Operator key provisioning: scan providers for missing keys; a POST
+    // supplies one without a restart. Key values never appear in responses.
+    if (req.method === 'GET' && pathname === '/api/providers') {
+      const providers = {};
+      for (const [name, prov] of Object.entries(config.providers ?? {})) {
+        providers[name] = {
+          type: prov.type ?? null,
+          baseUrl: prov.type === 'openai-compat' ? (prov.baseUrl ?? null) : null,
+          defaultModel: prov.defaultModel ?? null,
+          apiKeyEnv: prov.type === 'openai-compat' ? (prov.apiKeyEnv ?? null) : null,
+          // null → keyless by design (mock); boolean → key present or not
+          hasKey: prov.type === 'openai-compat'
+            ? Boolean(env?.[prov.apiKeyEnv] ?? process.env[prov.apiKeyEnv])
+            : null
+        };
+      }
+      return sendJson(res, 200, { providers, roles: config.roles ?? {} });
+    }
+
+    if (req.method === 'POST' && segments.length === 1 && segments[0] === 'provider-key') {
+      const body = await readJsonBody(req);
+      const name = typeof body.provider === 'string' ? body.provider : '';
+      const prov = config.providers?.[name];
+      if (!prov) throw httpError('bad_request', `unknown provider "${name}"`);
+      if (prov.type !== 'openai-compat' || !prov.apiKeyEnv) {
+        throw httpError('bad_request', `provider "${name}" takes no API key`);
+      }
+      const key = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+      if (key.length < 8 || /\s/.test(key)) {
+        throw httpError('bad_request', 'apiKey must be at least 8 characters with no whitespace');
+      }
+      // Live: the env object is shared with the orchestrator and providers
+      // are built per spawn, so the key applies without a restart.
+      env[prov.apiKeyEnv] = key;
+      // Durable: upsert into the operator .env so restarts keep the key.
+      const persisted = envFile ? await upsertEnvValue(envFile, prov.apiKeyEnv, key) : false;
+      // Optional activation: swap the master/worker role providers live and
+      // persist the roles to the operator config.
+      let activated = false;
+      let rolesPersisted = envFile ? true : false;
+      if (body.activate === true) {
+        const setProvider = (roles) => {
+          for (const roleName of ['master', 'worker']) {
+            const cur = roles[roleName];
+            roles[roleName] = { ...(cur && typeof cur === 'object' ? cur : {}), provider: name };
+          }
+        };
+        config.roles ?? (config.roles = {});
+        setProvider(config.roles);
+        activated = true;
+        if (configFile) rolesPersisted = await persistConfigMutation(configFile, setProvider);
+      }
+      return sendJson(res, 200, { ok: true, provider: name, hasKey: true, activated, persisted, rolesPersisted });
+    }
 
     if (req.method === 'POST' && segments.length === 1 && segments[0] === 'challenges') {
       const body = await readJsonBody(req);
