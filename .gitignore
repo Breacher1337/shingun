@@ -12,3 +12,6 @@ QUESTIONS.md
 # misc
 *.tmp
 *.log
+
+# python virtualenvs
+.venv/
