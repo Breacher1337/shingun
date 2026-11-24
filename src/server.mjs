@@ -332,7 +332,9 @@ export async function startServer({
     '/': { file: 'index.html', type: 'text/html; charset=utf-8' },
     '/index.html': { file: 'index.html', type: 'text/html; charset=utf-8' },
     '/dashboard.mjs': { file: 'dashboard.mjs', type: 'text/javascript; charset=utf-8' },
-    '/style.css': { file: 'style.css', type: 'text/css; charset=utf-8' }
+    '/style.css': { file: 'style.css', type: 'text/css; charset=utf-8' },
+    '/tokens.css': { file: 'tokens.css', type: 'text/css; charset=utf-8' },
+    '/theme-preview.html': { file: 'theme-preview.html', type: 'text/html; charset=utf-8' }
   };
 
   async function serveStatic(res, entry) {
