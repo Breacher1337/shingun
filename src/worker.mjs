@@ -42,6 +42,7 @@ export async function runWorker({
   flagFormat,
   dirs, // { worktree, scratch, tools, notes, transcript }
   provider,
+  lane = null, // model lane name when this worker rides roles.lanes.<name>
   budgetGuard,
   config,
   emit,        // (type, data) → orchestrator store + bus
@@ -68,6 +69,12 @@ export async function runWorker({
   let proseStrikes = 0;
   const scopeIds = [`worker:${workerId}`, `challenge:${challengeId}`, `swarm:${swarmId}`];
   budgetGuard.addScope(`worker:${workerId}`, { tokenCap: caps.maxTokens });
+  if (lane) {
+    // Lane attribution gets its own ledger line; uncapped by default so the
+    // line reports spend without tightening any per-worker/challenge/swarm cap.
+    budgetGuard.addScope(`lane:${lane}`);
+    scopeIds.push(`lane:${lane}`);
+  }
 
   const status = (s, reason) => emit('worker.status', { status: s, reason });
   const progress = () => emit('worker.progress', { steps, tokensIn, tokensOut, seenAt: Date.now() });
@@ -116,6 +123,7 @@ export async function runWorker({
     tokensOut += res.usage.tokensOut;
     emit('usage.tick', {
       role: 'worker', provider: provider.name ?? 'unknown',
+      ...(lane ? { lane } : {}),
       tokensIn: res.usage.tokensIn, tokensOut: res.usage.tokensOut,
       costUsd: (res.usage.tokensIn / 1e6) * price.in + (res.usage.tokensOut / 1e6) * price.out,
       workerId

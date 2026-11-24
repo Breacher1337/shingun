@@ -14,7 +14,8 @@ export const PERSONA_CATALOG = {
   },
   'scripter': {
     title: 'Scripter / Exploit Engineer',
-    strategy: 'Write pwntools/python/z3 solver scripts immediately; iterate on solver code rather than reading everything first. Prefer executable proof over theory.'
+    strategy: 'Write pwntools/python/z3 solver scripts immediately; iterate on solver code rather than reading everything first. Prefer executable proof over theory.',
+    lane: 'coder'
   },
   'crypto-algebraist': {
     title: 'Crypto Algebraist',

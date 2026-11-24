@@ -17,7 +17,10 @@
   "roles": {
     "master": { "provider": "mock", "model": null },
     "worker": { "provider": "mock", "model": null },
-    "oracle": null
+    "oracle": null,
+    "lanes": {
+      "coder": { "provider": "mistral", "model": "devstral" }
+    }
   },
   "providers": {
     "mistral": {

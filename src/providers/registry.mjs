@@ -4,9 +4,12 @@ import { createMock } from './mock.mjs';
 /**
  * Role→provider resolution: roles map to a provider config entry; any
  * OpenAI-compatible endpoint, or the keyless mock, slots in by config.
+ * A role name of the form "lanes:<name>" resolves a per-persona model lane
+ * from roles.lanes.<name> instead — same shape, same rules.
  */
 export function getProvider(config, roleName, { scrubber, logSink, fetchFn, env = {} } = {}) {
-  const role = config.roles?.[roleName];
+  const laneMatch = /^lanes:([\w-]+)$/.exec(roleName);
+  const role = laneMatch ? config.roles?.lanes?.[laneMatch[1]] : config.roles?.[roleName];
   if (!role || !role.provider) {
     throw Object.assign(new Error(`role "${roleName}" is not configured`), { code: 'role_unconfigured' });
   }

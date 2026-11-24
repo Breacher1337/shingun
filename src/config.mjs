@@ -22,7 +22,10 @@ export const DEFAULT_CONFIG = {
     // Point these at "mistral" (or any provider key) in config.json.
     master: { provider: 'mock', model: null },
     worker: { provider: 'mock', model: null },
-    oracle: null
+    oracle: null,
+    // Per-persona model lanes: a persona whose catalog entry names a lane
+    // rides roles.lanes.<name> when configured, and the worker role otherwise.
+    lanes: {}
   },
   providers: {
     mistral: {

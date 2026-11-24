@@ -39,6 +39,19 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
     return getProvider(config, role, { scrubber, env, logSink });
   }
 
+  /**
+   * Worker provider resolution with per-persona model lanes: a persona whose
+   * catalog entry names a lane rides roles.lanes.<name> when that lane is
+   * configured; everyone else rides the plain worker role. Returns
+   * { lane, providerFor(logSink) } so spawn sites stay one call.
+   */
+  function getWorkerLane(persona) {
+    const lane = PERSONA_CATALOG[persona]?.lane;
+    return lane && config.roles?.lanes?.[lane]?.provider
+      ? { lane, role: `lanes:${lane}` }
+      : { lane: null, role: 'worker' };
+  }
+
   const personaFallbackStrategy = (key) => (PERSONA_CATALOG[key] ?? PERSONA_CATALOG['static-analyst']).strategy;
 
   /** Challenge basename from its source value — the mock lane's fixture slug. */
@@ -173,12 +186,14 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
     await ensureDir(dirs.scratch);
     const jail = await makeJail([dirs.worktree, dirs.scratch, dirs.tools, dirs.notes, s.challenge.baseDir]);
 
+    const workerLane = getWorkerLane(persona);
     const result = await runWorker({
       workerId: wid, swarmId: s.id, challengeId: s.challengeId,
       challengeSlug: sourceSlug(s.challenge.sourceValue),
       persona, strategyPrompt, digestText, flagFormat: challengeFlag,
       dirs,
-      provider: getProviderFor('worker', { logSink: path.join(s.chDir, 'transcripts', `${wid}.outbound.jsonl`) }),
+      lane: workerLane.lane,
+      provider: getProviderFor(workerLane.role, { logSink: path.join(s.chDir, 'transcripts', `${wid}.outbound.jsonl`) }),
       budgetGuard: guard, config,
       emit: async (type, data) => {
         if (type === 'worker.progress') {

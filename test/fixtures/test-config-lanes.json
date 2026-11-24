@@ -1,0 +1,9 @@
+{
+  "admission": { "meminfoPath": "./test/fixtures/meminfo-ok" },
+  "providers": {
+    "mock2": { "type": "mock", "fixtureDir": "./test/fixtures/mock", "pricePerMTok": { "in": 0.70, "out": 2.10 } }
+  },
+  "roles": {
+    "lanes": { "coder": { "provider": "mock2", "model": null } }
+  }
+}
