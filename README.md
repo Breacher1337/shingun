@@ -124,3 +124,8 @@ Zero runtime dependencies by choice — copy the folder, install Node, run.
 The event store (append-only JSONL) is the single source of truth; all state
 is reconstructed by deterministic replay, so a crash costs you a restart,
 not your run.
+
+## License
+
+Apache-2.0 (see [LICENSE](LICENSE)). A personal tool: maintained for its
+author's use, shared as-is.
