@@ -2,6 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ingestChallenge } from './ingest.mjs';
+import { buildBundle } from './bundle.mjs';
 import { listTree, nowIso, writeJson } from './util.mjs';
 
 /**
@@ -126,6 +127,43 @@ export async function startServer({
     const name = host.replace(/:\d+$/, '').toLowerCase();
     return LOCAL_HOSTNAMES.has(name);
   };
+
+  // -- launch preflight ----------------------------------------------------
+
+  /**
+   * Every role the engine calls must be backed by a configured provider,
+   * and OpenAI-compatible providers must have something that resembles an
+   * API key. A URL-shaped value is the classic "pasted the dashboard
+   * address into the key field" mistake — refuse it up front with a
+   * message that says exactly that, instead of letting the swarm die
+   * mid-triage inside a cryptic 401.
+   */
+  function preflightRoleProviders() {
+    for (const roleName of ['master', 'worker']) {
+      const provName = config.roles?.[roleName]?.provider;
+      const prov = config.providers?.[provName];
+      if (!prov || !provName) {
+        return { code: 'provider_role_unconfigured', message: `role "${roleName}" has no provider — configure it in settings` };
+      }
+      if (prov.type === 'openai-compat') {
+        const provNameForMsg = provName;
+        const key = env?.[prov.apiKeyEnv] ?? process.env[prov.apiKeyEnv];
+        if (typeof key === 'string' && /:\/\//.test(key)) {
+          return {
+            code: 'provider_key_invalid',
+            message: `provider "${provNameForMsg}" used by role "${roleName}" holds "${key.slice(0, 40)}…" — that is a web address, not an API key. Paste the model provider key in settings, or switch the role to the keyless mock provider.`
+          };
+        }
+        if (!key) {
+          return {
+            code: 'provider_key_missing',
+            message: `provider "${provNameForMsg}" used by role "${roleName}" has no API key — paste one in settings, or switch the role to the keyless mock provider.`
+          };
+        }
+      }
+    }
+    return null;
+  }
 
   // -- filesystem helpers ------------------------------------------------
 
@@ -452,6 +490,9 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
       if (key.length < 8 || /\s/.test(key)) {
         throw httpError('bad_request', 'apiKey must be at least 8 characters with no whitespace');
       }
+      if (/:\/\//.test(key)) {
+        throw httpError('bad_request', 'apiKey looks like a web address — that is the dashboard URL, not a model provider key. Paste the API key issued by the provider console (for mistral: console.mistral.ai → API keys).');
+      }
       // Live: the env object is shared with the orchestrator and providers
       // are built per spawn, so the key applies without a restart.
       env[prov.apiKeyEnv] = key;
@@ -474,6 +515,35 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
         if (configFile) rolesPersisted = await persistConfigMutation(configFile, setProvider);
       }
       return sendJson(res, 200, { ok: true, provider: name, hasKey: true, activated, persisted, rolesPersisted });
+    }
+
+    // Role switching: point master/worker at any configured provider,
+    // including the keyless mock — the escape hatch when no key is around.
+    if (req.method === 'POST' && segments.length === 1 && segments[0] === 'roles') {
+      const body = await readJsonBody(req);
+      const wanted = {};
+      if (typeof body.both === 'string') { wanted.master = body.both; wanted.worker = body.both; }
+      if (typeof body.master === 'string') wanted.master = body.master;
+      if (typeof body.worker === 'string') wanted.worker = body.worker;
+      const names = Object.values(wanted);
+      if (!names.length) throw httpError('bad_request', 'body must name master, worker, or both');
+      for (const n of names) {
+        if (!config.providers?.[n]) throw httpError('bad_request', `unknown provider "${n}"`);
+      }
+      config.roles ?? (config.roles = {});
+      for (const [roleName, provName] of Object.entries(wanted)) {
+        const cur = config.roles[roleName];
+        config.roles[roleName] = { ...(cur && typeof cur === 'object' ? cur : {}), provider: provName };
+      }
+      const persisted = configFile
+        ? await persistConfigMutation(configFile, (f) => {
+            f.roles ?? (f.roles = {});
+            for (const [roleName, provName] of Object.entries(wanted)) {
+              f.roles[roleName] = { ...(f.roles[roleName] && typeof f.roles[roleName] === 'object' ? f.roles[roleName] : {}), provider: provName };
+            }
+          })
+        : false;
+      return sendJson(res, 200, { ok: true, roles: config.roles, persisted, issues: preflightRoleProviders() });
     }
 
     if (req.method === 'POST' && segments.length === 1 && segments[0] === 'challenges') {
@@ -526,6 +596,8 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
         }
         budgetUsd = Math.min(budgetUsd, config.budget.perSwarmUsd);
       }
+      const providerIssue = preflightRoleProviders();
+      if (providerIssue) throw httpError(providerIssue.code, providerIssue.message);
       const { swarmId } = await orchestrator.startSwarm({
         challenge: {
           id: challengeId,
@@ -569,6 +641,21 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
         }
         await orchestrator.stop(swarmId, 'user');
         return sendJson(res, 200, { stopped: true });
+      }
+
+      // Review bundle download: terminal swarms only (the bundle builder
+      // enforces the same, this is just HTTP-shaped error reporting).
+      if (req.method === 'GET' && segments.length === 3 && segments[2] === 'bundle') {
+        const out = await buildBundle({ swarmId, workspaceDir, bus });
+        const bytes = await fs.readFile(out.path).catch(() => null);
+        if (bytes === null) throw httpError('internal', 'bundle built but unreadable');
+        res.writeHead(200, {
+          'Content-Type': 'application/gzip',
+          'Content-Disposition': `attachment; filename="shingun-${swarmId}.tar.gz"`,
+          'Cache-Control': 'no-store'
+        });
+        res.end(bytes);
+        return;
       }
 
       if (req.method === 'POST' && segments.length === 5 && segments[2] === 'workers' && segments[4] === 'message') {
@@ -624,9 +711,13 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
   const requestHandler = (req, res) => handle(req, res).catch((e) => {
     const code = e?.code ?? 'internal';
     if (!res.headersSent) {
-      const status = ['swarm_unknown', 'challenge_unknown', 'worker_unknown', 'not_found'].includes(code) ? 404
-        : ['bad_json', 'bad_request', 'payload_too_large'].includes(code) ? 400
+      const notFound = ['swarm_unknown', 'challenge_unknown', 'worker_unknown', 'not_found', 'bundle_empty'];
+      const badRequest = ['bad_json', 'bad_request', 'payload_too_large', 'provider_key_missing', 'provider_key_invalid', 'provider_role_unconfigured'];
+      const status = notFound.includes(code) ? 404
+        : badRequest.includes(code) ? 400
         : code === 'unauthorized' ? 401
+        : code === 'bundle_not_terminal' ? 409
+        : code === 'provider_http' ? 502
         : 500;
       res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ error: { code, message: e?.message ?? String(e) } }));

@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import { sleep } from '../util.mjs';
 
 /**
@@ -12,7 +13,7 @@ export function createOpenaiCompat({ baseUrl, apiKey, defaultModel, price, scrub
   async function log(entry) {
     if (!logSink) return;
     try {
-      await fs.mkdir(new URL('.', `file://${logSink.replace(/\\/g, '/')}`).pathname, { recursive: true }).catch(() => {});
+      await fs.mkdir(path.dirname(logSink), { recursive: true }).catch(() => {});
       await fs.appendFile(logSink, JSON.stringify({ t: Date.now(), ...entry }) + '\n', 'utf8');
     } catch { /* logging must never fail a provider call */ }
   }
@@ -56,6 +57,13 @@ export function createOpenaiCompat({ baseUrl, apiKey, defaultModel, price, scrub
             return { message, usage };
           }
           lastErr = Object.assign(new Error(`provider HTTP ${res.status}`), { code: 'provider_http', status: res.status });
+          if (res.status === 401 || res.status === 403) {
+            // Surface the why: an unauthorized call is almost always a key
+            // problem, and burying it behind a bare status fails operators.
+            const detail = (await res.text().catch(() => '')).slice(0, 240).replace(/\s+/g, ' ').trim();
+            lastErr.message = `provider HTTP ${res.status} (${detail || 'unauthorized'} — check the API key for this provider)`;
+            break;
+          }
           if (res.status !== 429 && res.status < 500) break;
         }
         if (attempt < 3) await sleep(1000 * 2 ** attempt);

@@ -101,6 +101,7 @@ const seqOf = (id) => Number(/-(\d+)$/.exec(String(id ?? ''))?.[1] ?? 0);
 const fmtTok = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n ?? 0));
 const fmtUsd = (n) => `$${(n ?? 0).toFixed(4)}`;
 const titleize = (s) => String(s ?? '').replace(/[-_]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+const dimStyle = 'margin:6px 0 0;color:var(--dim);font-size:11.5px;line-height:1.55';
 
 // ---- shell ----------------------------------------------------------------
 
@@ -131,12 +132,14 @@ function topbar() {
       h('div', { class: 'meter', id: 'tb-budget-meter' }, h('i')),
       h('span', { class: 'meter-text', id: 'tb-budget-text' }, '— / —')
     ),
-    h('span', { class: 'chip flag-chip', id: 'tb-flags', title: '' }, 'flags ', h('span', { class: 'flagcount' }, '0')),
+    h('span', { class: 'chip flag-chip', id: 'tb-flags', title: '', onclick: openFlagsPanel }, 'flags ', h('span', { class: 'flagcount' }, '0')),
     h('span', { class: 'grow' }),
     h('span', { class: 'swarm-entry' },
       h('input', { id: 'tb-swarm-input', placeholder: 'swarm id', spellcheck: 'false' }),
       h('button', { onclick: () => connectSwarm($('#tb-swarm-input').value.trim()) }, 'connect')
     ),
+    h('button', { id: 'tb-stop', onclick: stopSwarm }, 'stop'),
+    h('button', { id: 'tb-export', onclick: exportBundle }, 'bundle'),
     h('button', { id: 'tb-new', onclick: openChallengeModal }, '+ challenge'),
     h('button', { id: 'tb-settings', onclick: openSettings }, 'settings')
   ];
@@ -274,6 +277,12 @@ function paintTopbar() {
     : TERMINAL.includes(state.status) ? 'var(--c-finish)'
     : state.status === 'running' ? 'var(--c-reason)' : 'var(--c-spawn)';
 
+  // Stop and bundle: visible exactly when they can act.
+  const liveSwarm = Boolean(state.swarmId) && !TERMINAL.includes(state.status) && !state.final;
+  $('#tb-stop').style.display = liveSwarm ? '' : 'none';
+  const solvedAndClosed = Boolean(state.swarmId) && state.flags.length > 0 && (TERMINAL.includes(state.status) || state.final);
+  $('#tb-export').style.display = solvedAndClosed ? '' : 'none';
+
   const cap = state.caps.perSwarmUsd || 0;
   const meterEl = $('#tb-budget-meter');
   const pct = cap > 0 ? Math.min(100, (state.budget.usd / cap) * 100) : 0;
@@ -300,6 +309,74 @@ function deckSpan(chip, text) {
   chip.querySelector('span').textContent = text;
 }
 
+// ---- swarm controls (stop / bundle / flags) ---------------------------------
+
+async function stopSwarm() {
+  if (!state.swarmId) return;
+  try {
+    const out = await api(`/api/swarms/${encodeURIComponent(state.swarmId)}/stop`, { method: 'POST', body: {} });
+    toast(out.already ? `swarm already ${out.already}` : 'swarm stopping — workers wind down');
+  } catch (e) {
+    toast(`stop failed: ${e.message}`, 'warn');
+  }
+}
+
+async function exportBundle() {
+  if (!state.swarmId) return;
+  try {
+    const res = await fetch(`/api/swarms/${encodeURIComponent(state.swarmId)}/bundle`, {
+      headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => null);
+      throw new Error(data?.error?.message ?? `bundle export ${res.status}`);
+    }
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `shingun-${state.swarmId}.tar.gz`;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+    toast('review bundle downloading');
+  } catch (e) {
+    toast(`bundle failed: ${e.message}`, 'warn', 12000);
+  }
+}
+
+async function copyText(text, confirmMsg) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(confirmMsg ?? 'copied');
+  } catch {
+    toast(text, '', 20000);
+  }
+}
+
+function openFlagsPanel() {
+  if (!state.flags.length) return;
+  const rows = state.flags.map((f) => h('div', { class: 'flag-row' },
+    h('code', { class: 'flag-lit' }, f.flag),
+    h('div', { class: 'flag-sub' }, `${f.formatMatch ?? 'unknown'} format · via ${f.workerId ?? 'worker'}`),
+    h('button', { onclick: () => copyText(f.flag, `copied ${f.flag}`) }, 'copy'),
+    f.reasoning ? h('div', { class: 'flag-why' }, f.reasoning) : null
+  ));
+  const modal = h('div', { class: 'overlay', onclick: (e) => { if (e.target === modal) modal.remove(); } },
+    h('div', { class: 'modal flags-modal' },
+      h('h2', null, 'flags'),
+      ...rows,
+      h('div', { class: 'btns' },
+        TERMINAL.includes(state.status) || state.final
+          ? h('button', { class: 'primary', onclick: exportBundle }, 'export review bundle')
+          : null,
+        h('button', { onclick: () => modal.remove() }, 'close')
+      )
+    )
+  );
+  app.append(modal);
+}
+
 // ---- worker tiles -------------------------------------------------------------
 
 function paintTiles() {
@@ -310,8 +387,9 @@ function paintTiles() {
       h('div', { class: 'empty-state' },
         h('span', { class: 'kanji' }, '進軍'),
         h('p', null, 'No swarm connected. Launch a challenge with ', h('code', null, '+ challenge'),
-          ', or paste a swarm id in the top bar. Example mock run:'),
-        h('p', null, h('code', null, 'shingun run test/fixtures/challenge-easy'))
+          ' — the preloaded demo is the bundled SQLi lab at ', h('code', null, 'examples/sqli-lab'), '.'),
+        h('p', null, 'Keep the lab serving with ', h('code', null, 'node examples/sqli-lab/app.mjs'),
+          ', then watch the swarm exploit it live here.')
       )
     );
     return;
@@ -509,7 +587,16 @@ function renderInspector() {
       class: `tab${state.tab === t ? ' on' : ''}`,
       onclick: () => { state.tab = t; renderInspector(); }
     }, t))),
-    body
+    body,
+    h('div', { class: 'steer-row' },
+      h('input', {
+        id: 'ins-steer', class: 'steer-input', spellcheck: 'false',
+        value: state.steerDraft ?? '',
+        placeholder: w.gone ? 'worker closed' : `steer ${w.persona} — one note, next step picks it up`,
+        disabled: w.gone === true ? true : undefined,
+        oninput: (e) => { state.steerDraft = e.target?.value ?? ''; }
+      }),
+      h('button', { id: 'ins-steer-send', onclick: () => sendSteer(w.id), disabled: w.gone === true ? true : undefined }, 'steer'))
   );
   const b = $('#ins-body');
   if (b && state.tab === 'transcript') b.scrollTop = b.scrollHeight;
@@ -526,14 +613,29 @@ async function loadDiff(wid) {
   }
 }
 
+async function sendSteer(wid) {
+  const input = $('#ins-steer');
+  const text = input?.value?.trim();
+  if (!text || !state.swarmId) return;
+  try {
+    await api(`/api/swarms/${encodeURIComponent(state.swarmId)}/workers/${encodeURIComponent(wid)}/message`, {
+      method: 'POST', body: { text }
+    });
+    input.value = '';
+    state.steerDraft = '';
+    toast('steering note queued — the worker picks it up on its next step');
+  } catch (e) {
+    toast(`steer failed: ${e.message}`, 'warn');
+  }
+}
+
 function openInspector(wid) {
   state.inspector = wid;
   state.tab = 'transcript';
   paintTiles();
   renderHero();
   renderInspector();
-}
-function closeInspector() {
+}function closeInspector() {
   state.inspector = null;
   $('#inspector').className = 'inspector';
   paintTiles();
@@ -654,7 +756,12 @@ function applyEvent(ev) {
     }
     case 'swarm.update':
       state.status = ev.data.status ?? state.status;
-      if (ev.data.final) state.final = true;
+      if (ev.data.final) {
+        state.final = true;
+        // Terminal: no further events can arrive — stop the stream instead
+        // of retrying it forever (a new swarm opens a fresh one).
+        sseAbort?.abort();
+      }
       paintTopbar();
       renderHero();
       if (TERMINAL.includes(state.status)) renderDeckStatus(state.status, state.status === 'solved');
@@ -776,7 +883,21 @@ async function connectSwarm(swarmId) {
 
 // ---- settings ----------------------------------------------------------------
 
-/** Set or rotate a provider API key at any time (OpenAI-compatible lanes). */
+/** Mirror of the server's launch preflight, for display purposes. */
+function roleIssues(info) {
+  const out = [];
+  for (const roleName of ['master', 'worker']) {
+    const provName = info.roles?.[roleName]?.provider;
+    const p = info.providers?.[provName];
+    if (!p) { out.push(`role ${roleName}: provider "${provName ?? '—'}" is not configured`); continue; }
+    if (p.type === 'openai-compat' && p.hasKey === false) {
+      out.push(`role ${roleName}: provider "${provName}" has no API key — swarms cannot launch until one is pasted or the role moves to a keyless provider`);
+    }
+  }
+  return out;
+}
+
+/** Set or rotate a provider API key, and point roles at any provider. */
 async function openSettings() {
   if ($('#settings-modal')) return;
   const modal = h('div', { class: 'overlay' },
@@ -794,62 +915,84 @@ async function openSettings() {
 }
 
 function renderSettings(modal, info, preferName) {
-  const keyable = Object.entries(info.providers ?? {}).filter(([, p]) => p.type === 'openai-compat' && p.apiKeyEnv);
-  if (!keyable.length) {
+  const names = Object.keys(info.providers ?? {});
+  if (!names.length) {
     modal.replaceChildren(
       h('div', { class: 'modal', id: 'settings-modal' }, h('h2', null, 'Settings'),
-        h('div', { class: 'kv' }, 'no keyable providers are configured in config.json'),
+        h('div', { class: 'kv' }, 'no providers are configured in config.json'),
         h('div', { class: 'btns' }, h('button', { onclick: () => modal.remove() }, 'close'))));
     return;
   }
   const roles = info.roles ?? {};
-  const chips = Object.entries(info.providers ?? {}).map(([n, p]) =>
-    h('span', { class: `act ${p.hasKey ? 'ok' : 'bad'}`, title: n },
-      `${n}: ${p.hasKey === null ? 'keyless by design' : p.hasKey ? 'key set' : 'key missing'}`));
-  const selected = keyable.some(([n]) => n === preferName) ? preferName : keyable[0][0];
-  const select = h('select', { id: 'st-prov', class: 'kinput',
-    onchange: (e) => renderSettings(modal, info, e.target.value) },
-    keyable.map(([n]) => h('option', { value: n, selected: n === selected }, n)));
+  const selected = names.includes(preferName) ? preferName
+    : (names.includes(roles.worker?.provider) ? roles.worker.provider : names[0]);
   const prov = info.providers[selected];
+  const takesKey = prov.type === 'openai-compat' && Boolean(prov.apiKeyEnv);
+  const usesItNow = roles.master?.provider === selected || roles.worker?.provider === selected;
+  const issues = roleIssues(info);
+  const roleLine = `master: ${roles.master?.provider ?? '—'} · worker: ${roles.worker?.provider ?? '—'}`;
+
+  const chips = names.map((n) => {
+    const p = info.providers[n];
+    const stateTxt = p.hasKey === null ? 'keyless by design' : (p.hasKey ? 'key set' : 'key missing');
+    return h('span', { class: `act ${p.hasKey === false ? 'bad' : 'ok'}`, title: n }, `${n}: ${stateTxt}`);
+  });
+
+  const select = h('select', { id: 'st-prov', class: 'kinput',
+    onchange: (e) => renderSettings(modal, info, e.target?.value ?? selected) },
+    names.map((n) => h('option', { value: n, selected: n === selected }, n)));
   const input = h('input', { id: 'st-key', class: 'kinput', type: 'password',
-    placeholder: prov.apiKeyEnv ?? 'API key', autocomplete: 'off', spellcheck: 'false' });
-  const roleUsesIt = roles.master?.provider === selected || roles.worker?.provider === selected;
-  const activate = h('input', { type: 'checkbox' });
-  activate.checked = roleUsesIt;
-  // Protect the in-flight key text across the selection re-render.
+    placeholder: takesKey ? (prov.apiKeyEnv ?? 'API key') : 'no key needed for this provider',
+    autocomplete: 'off', spellcheck: 'false' });
   const prevKey = modal.querySelector('#st-key')?.value ?? '';
   input.value = prevKey;
+  const activate = h('input', { type: 'checkbox' });
+  activate.checked = usesItNow;
   const err = h('div', { class: 'kerr' });
-  const roleLine = `master: ${roles.master?.provider ?? '—'} · worker: ${roles.worker?.provider ?? '—'}`;
 
   const body = h('div', { class: 'modal', id: 'settings-modal' },
     h('h2', null, 'Settings'),
     h('div', { class: 'acts' }, ...chips),
     h('label', { class: 'krow' }, 'provider', select),
-    h('label', { class: 'krow' }, 'api key', input),
+    takesKey ? h('label', { class: 'krow' }, 'api key', input) : null,
     h('label', { class: 'krow kcheck' }, activate, `use ${selected} for master + worker`),
-    h('p', { class: 'dim', style: 'margin:2px 0 6px;color:var(--dim);font-size:12px' },
-      'The pasted key applies immediately and overwrites the stored one. Roles now: ' + roleLine + '.'),
+    h('p', { class: 'dim', style: dimStyle },
+      'Roles now: ' + roleLine + '. A pasted key applies immediately and overwrites the stored one. The mock provider runs keyless by design — the bundled dry-run lane.'),
+    issues.length ? h('div', { class: 'kerr', style: 'border-left:3px solid var(--c-stall);padding-left:8px' },
+      issues.map((i) => h('div', null, '⚠ ' + i))) : null,
     err,
     h('div', { class: 'btns' },
       h('button', {
         class: 'primary', onclick: async () => {
           err.replaceChildren();
           const key = input.value.trim();
-          if (!key) { err.replaceChildren('paste a key first'); return; }
-          try {
-            const res = await api('/api/provider-key', {
-              method: 'POST', body: { provider: selected, apiKey: key, activate: activate.checked }
-            });
-            toast(`key saved for ${res.provider}${res.activated ? ' — roles activated' : ''}`, 'flag', 12000);
-            const fresh = await api('/api/providers');
-            renderSettings(modal, fresh, selected);
-            checkProviders(); // sync the boot card with the new state
-          } catch (e) {
-            err.replaceChildren(`save failed: ${e.message}`);
+          if (takesKey && key) {
+            try {
+              const res = await api('/api/provider-key', {
+                method: 'POST', body: { provider: selected, apiKey: key, activate: activate.checked }
+              });
+              toast(`key saved for ${res.provider}${res.activated ? ' — roles activated' : ''}`, 'flag', 12000);
+            } catch (e) {
+              err.replaceChildren(`save failed: ${e.message}`);
+              return;
+            }
+          } else if (activate.checked) {
+            try {
+              await api('/api/roles', { method: 'POST', body: { both: selected } });
+              toast(`master + worker now use ${selected}`, 'flag', 12000);
+            } catch (e) {
+              err.replaceChildren(`role switch failed: ${e.message}`);
+              return;
+            }
+          } else {
+            err.replaceChildren(takesKey ? 'paste a key, or tick “use for master + worker”' : 'tick “use for master + worker” to switch roles');
+            return;
           }
+          const fresh = await api('/api/providers').catch(() => info);
+          renderSettings(modal, fresh, selected);
+          checkProviders(); // sync the boot card with the new state
         }
-      }, 'save key'),
+      }, takesKey ? 'save key + roles' : 'apply'),
       h('button', { onclick: () => modal.remove() }, 'close')));
 
   modal.replaceChildren(body);
@@ -866,16 +1009,23 @@ function openChallengeModal() {
         h('option', { value: 'path' }, 'local path'),
         h('option', { value: 'url' }, 'git url')),
       h('label', null, 'value (path or https url)'),
-      h('input', { id: 'nl-value', placeholder: 'test/fixtures/challenge-easy', spellcheck: 'false' }),
+      h('input', { id: 'nl-value', value: 'examples/sqli-lab', spellcheck: 'false' }),
       h('div', { class: 'row' },
-        h('div', null, h('label', null, 'flag format regex (optional)'), h('input', { id: 'nl-flag', placeholder: 'shingun\\{[^}]*\\}', spellcheck: 'false' })),
-        h('div', null, h('label', null, 'workers (optional)'), h('input', { id: 'nl-workers', placeholder: '—' }))),
+        h('div', null, h('label', null, 'flag format regex'), h('input', { id: 'nl-flag', value: 'shingun\\{[^}]*\\}', spellcheck: 'false' })),
+        h('div', null, h('label', null, 'category hint'), h('select', { id: 'nl-cat' },
+          h('option', { value: '' }, '—'),
+          ...['web', 'crypto', 'pwn', 'rev', 'forensics', 'misc'].map((c) => h('option', { value: c }, c)))),
+        h('div', null, h('label', null, 'workers'), h('input', { id: 'nl-workers', placeholder: '—' }))),
+      h('p', { class: 'dim', style: dimStyle },
+        'bundled demo: examples/sqli-lab — the Sakura Surplus SQLi storefront. Have it serving first: ',
+        h('code', null, 'node examples/sqli-lab/app.mjs'), '. provider keys live in settings.'),
       h('div', { class: 'btns' },
         h('button', { onclick: () => modal.remove() }, 'cancel'),
         h('button', { class: 'primary', id: 'nl-go' }, 'ingest + launch swarm'))
     ));
   app.append(modal);
   $('#nl-value').focus();
+  $('#nl-value').select?.();
   $('#nl-go').addEventListener('click', async () => {
     const go = $('#nl-go');
     const source = $('#nl-source').value;
@@ -886,7 +1036,8 @@ function openChallengeModal() {
     try {
       const ch = await api('/api/challenges', { method: 'POST', body: {
         source, value,
-        ...( $('#nl-flag').value.trim() ? { flagFormatRegex: $('#nl-flag').value.trim() } : {})
+        ...($('#nl-flag').value.trim() ? { flagFormatRegex: $('#nl-flag').value.trim() } : {}),
+        ...($('#nl-cat').value ? { categoryHint: $('#nl-cat').value } : {})
       } });
       go.textContent = 'starting swarm…';
       const gen = await api(`/api/challenges/${encodeURIComponent(ch.challengeId)}/swarm`, { method: 'POST', body: {
@@ -898,21 +1049,25 @@ function openChallengeModal() {
     } catch (e) {
       go.disabled = false;
       go.textContent = 'ingest + launch swarm';
-      toast(`launch failed: ${e.message}`, 'warn', 12000);
+      if (/provider_key_missing|provider_key_invalid|provider_role_unconfigured|API key|api key/i.test(e.message)) {
+        toast(`launch blocked: ${e.message}`, 'warn', 20000);
+        openSettings();
+      } else {
+        toast(`launch failed: ${e.message}`, 'warn', 12000);
+      }
     }
   });
 }
 
 // ---- provider key provisioning ----------------------------------------------
 
-/** Scan providers; surface a quick key card when one is configured but keyless. */
+/** Scan providers; surface the launch-blocker card only when a role is stuck. */
 async function checkProviders() {
   let info = null;
   try { info = await api('/api/providers'); } catch { return; /* scan degrades silently */ }
   hideKeyCard(); // idempotent; re-render with fresh state
-  const missing = new Map(Object.entries(info.providers ?? {})
-    .filter(([, p]) => p.type === 'openai-compat' && !p.hasKey));
-  if (missing.size) showKeyCard(missing, info.roles ?? {});
+  const issues = roleIssues(info);
+  if (issues.length) showKeyCard(issues, info);
 }
 
 function hideKeyCard() {
@@ -920,55 +1075,51 @@ function hideKeyCard() {
   if (location.hash === '#api-key') history.replaceState({}, '', location.pathname);
 }
 
-function showKeyCard(missing, roles) {
+function showKeyCard(issues, info) {
   if ($('#key-card')) return;
-  const names = [...missing.keys()];
-  const roleUser = names.includes(roles?.master?.provider) || names.includes(roles?.worker?.provider);
-  const select = h('select', { id: 'kc-prov', class: 'kinput' },
-    names.map((n) => h('option', { value: n, selected: n === names[0] }, n)));
-  const input = h('input', { id: 'kc-key', class: 'kinput', type: 'password',
-    placeholder: missing.get(names[0])?.apiKeyEnv ?? 'API key', autocomplete: 'off', spellcheck: 'false' });
-  const activate = h('input', { id: 'kc-act', type: 'checkbox' });
-  activate.checked = true;
-  const err = h('div', { id: 'kc-err', class: 'kerr' });
+  const keyless = Object.entries(info.providers ?? {})
+    .find(([, p]) => p.type === 'mock');
+  const keylessName = keyless ? keyless[0] : null;
+  const subject = info.roles?.worker?.provider ?? info.roles?.master?.provider ?? 'the wired provider';
+  const err = h('div', { class: 'kerr' });
   const card = h('div', { id: 'key-card', class: 'key-card' },
     h('div', { class: 'key-card-box' },
-      h('h2', {}, `${names.join(' / ')} provider needs an api key`),
+      h('h2', {}, `swarms cannot launch yet — ${subject}`),
       h('p', { class: 'dim' },
-        roleUser
-          ? 'A role already points at this provider, but its API key is missing — swarms against it cannot run. paste the key to continue.'
-          : 'this provider is configured but has no API key yet. paste one and activate it for the master + worker roles, or keep the keyless mock provider.'),
-      h('p', { class: 'dim' }, 'This is the model provider\u2019s API key (e.g. the Mistral console key). It is NOT the dashboard access token \u2014 nothing entered here unlocks the page.'),
-      h('label', { class: 'krow' }, 'provider', select),
-      h('label', { class: 'krow' }, 'api key', input),
-      h('label', { class: 'krow kcheck' }, activate, 'use this provider for master + worker'),
+        issues.map((i) => h('div', null, i.replace(/^role (master|worker): /, '')))),
+      h('p', { class: 'dim' },
+        'The engine calls a model provider; that needs the provider\u2019s API key (for mistral: console.mistral.ai → API keys). ',
+        'That key is NOT this dashboard\u2019s address or access token. Or run the keyless mock provider — the bundled dry-run lane works with no key at all.'),
       err,
       h('div', { class: 'kactions' },
         h('button', {
           class: 'kbtn', onclick: async () => {
             err.replaceChildren();
             try {
-              const res = await api('/api/provider-key', {
-                method: 'POST',
-                body: { provider: select.value, apiKey: input.value.trim(), activate: activate.checked }
-              });
-              toast(`key saved for ${res.provider}${res.activated ? ' — roles activated' : ''}`, 'flag', 12000);
-              if (res.persisted === false) {
-                toast('warning: key not persisted to .env — it will not survive a restart', 'warn', 15000);
-              }
+              openSettings();
               hideKeyCard();
             } catch (e) {
-              err.replaceChildren(`save failed: ${e.message}`);
+              err.replaceChildren(`could not open settings: ${e.message}`);
             }
           }
-        }, 'save key'),
-        h('button', { class: 'kbtn ghost', onclick: hideKeyCard }, roleUser ? 'fix later' : 'keep using mock')
+        }, 'open settings'),
+        keylessName ? h('button', {
+          class: 'kbtn', onclick: async () => {
+            err.replaceChildren();
+            try {
+              await api('/api/roles', { method: 'POST', body: { both: keylessName } });
+              toast(`master + worker switched to ${keylessName} — keyless dry-run mode`, 'flag');
+              hideKeyCard();
+            } catch (e) {
+              err.replaceChildren(`switch failed: ${e.message}`);
+            }
+          }
+        }, `switch roles to ${keylessName} (keyless)`) : null,
+        h('button', { class: 'kbtn ghost', onclick: hideKeyCard }, 'dismiss')
       )
     )
   );
   document.body.append(card);
-  location.hash = '#api-key';
-  input.focus();
 }
 
 // ---- boot -------------------------------------------------------------------

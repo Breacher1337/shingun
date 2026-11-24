@@ -129,7 +129,7 @@ test('acceptance 3b-3: a steered note is injected at the next step boundary', as
   const { createBus } = await import('../src/bus.mjs');
   const { createOrchestrator } = await import('../src/orchestrator.mjs');
   const ws = await tmpWorkspace('steer-engine-');
-  const { config, env } = await loadConfig({ file: path.join(ROOT, 'config.json') });
+  const { config, env } = await loadConfig({ file: path.join(ROOT, 'test', 'fixtures', 'test-config.json') });
   const bus = createBus();
   const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, ws), env, bus });
 

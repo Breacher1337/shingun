@@ -69,8 +69,10 @@ input, select, textarea { font: inherit; }
 .meter-text { font-size: 11px; color: var(--dim); white-space: nowrap; }
 .budget.flash .meter { outline: 1px solid var(--c-dead); }
 
-.flag-chip { cursor: default; }
+.flag-chip { cursor: pointer; }
 .flag-chip .flagcount { color: var(--c-solved); font-weight: 700; }
+#tb-stop { color: #ffb787; border-color: #5a2c2c; }
+#tb-stop:hover { border-color: #8d2f2f; color: #ffd9a0; }
 
 .topbar .grow { flex: 1; }
 .topbar button {
@@ -289,3 +291,20 @@ input, select, textarea { font: inherit; }
 .kbtn:hover { filter: brightness(1.12); }
 .kbtn.ghost { background: transparent; border-color: var(--line-2); color: var(--dim); }
 .kerr { color: var(--c-stall); font-size: 12px; min-height: 16px; margin-top: 6px; }
+
+/* flags panel (trophy room) */
+.flags-modal { width: min(520px, 92vw); max-height: 76vh; overflow-y: auto; }
+.flag-row { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 8px 0; background: var(--panel); }
+.flag-lit { display: block; color: var(--c-solved); font-size: 13.5px; font-weight: 700; word-break: break-all; }
+.flag-sub { color: var(--dim); font-size: 11px; margin-top: 3px; }
+.flag-why { color: var(--dim); font-size: 11.5px; margin-top: 6px; font-style: italic; }
+.flag-row button { margin-top: 8px; }
+
+/* inspector steer row */
+.steer-row { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--line); }
+.steer-row .steer-input { flex: 1; background: var(--bg); border: 1px solid var(--line-2); border-radius: 7px;
+  color: var(--text); padding: 7px 10px; font-size: 11.5px; }
+.steer-row .steer-input:focus { outline: none; border-color: var(--accent); }
+.steer-row button { border: 1px solid var(--line-2); background: var(--panel-2); color: var(--text);
+  border-radius: 7px; padding: 7px 12px; font-size: 11.5px; }
+.steer-row button:hover { border-color: var(--accent); }

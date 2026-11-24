@@ -159,7 +159,7 @@ test('acceptance 2a: server boots and gates everything behind the token', async 
 
 test('acceptance 2a-2: without SHINGUN_TOKEN the workspace is open — and host-guarded', async () => {
   const ws = await tmpWorkspace('open-');
-  const { config, env } = await loadConfig({ file: path.join(ROOT, 'config.json'), profile: 'low-power' });
+  const { config, env } = await loadConfig({ file: path.join(ROOT, 'test', 'fixtures', 'test-config.json'), profile: 'low-power' });
   const openedEnv = { ...env };
   delete openedEnv.SHINGUN_TOKEN;
   const bus = createBus();

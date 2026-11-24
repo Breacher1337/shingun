@@ -38,6 +38,14 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
 
   const personaFallbackStrategy = (key) => (PERSONA_CATALOG[key] ?? PERSONA_CATALOG['static-analyst']).strategy;
 
+  /** Challenge basename from its source value — the mock lane's fixture slug. */
+  function sourceSlug(sourceValue) {
+    const raw = String(sourceValue ?? '').replace(/[\\/]+$/, '');
+    let base = raw.split(/[\\/]/).pop() ?? '';
+    if (/\.git$/i.test(base)) base = base.slice(0, -4);
+    return /^[\w.-]{1,64}$/.test(base) ? base : null;
+  }
+
   const syncStub = (id, tag) => ({
     id, persona: `(${tag})`, steps: 0, tokensIn: 0, tokensOut: 0,
     lastProgressAt: Date.now(), stallChecks: 0, lastStatus: 'spawning', live: true,
@@ -164,6 +172,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
 
     const result = await runWorker({
       workerId: wid, swarmId: s.id, challengeId: s.challengeId,
+      challengeSlug: sourceSlug(s.challenge.sourceValue),
       persona, strategyPrompt, digestText, flagFormat: challengeFlag,
       dirs,
       provider: getProviderFor('worker', { logSink: path.join(s.chDir, 'transcripts', `${wid}.outbound.jsonl`) }),
@@ -431,6 +440,18 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
           ? null
           : ([...events].reverse().find((e) => e.type === 'swarm.update')?.data?.status ?? 'planning');
         if (!['running', 'planning'].includes(lastStatus)) continue;
+
+        // A "planning" store with no worker ever spawned is a launch that
+        // died inside triage — nothing to resume. Mark it final rather than
+        // resurrecting phantom workers from a swarm that never started.
+        if (lastStatus === 'planning' && !events.some((e) => e.type === 'worker.spawn')) {
+          const ev = await store.append({
+            type: 'swarm.update', swarm: swarmId, challenge: d.name,
+            data: { status: 'stopped', final: true, reason: 'resume: launch never started' }
+          });
+          bus?.publish(ev);
+          continue;
+        }
 
         // Rebuild: flags, per-worker state, usage totals.
         const flags = events.filter((e) => e.type === 'flag.found').map((e) => ({ ...e.data, workerId: e.worker }));

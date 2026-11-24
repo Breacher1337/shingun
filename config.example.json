@@ -15,8 +15,8 @@
   "admission": { "enabled": true, "watermarkMb": 1536, "meminfoPath": "/proc/meminfo", "retryMs": 10000 },
   "budget": { "perChallengeUsd": 5.00, "perSwarmUsd": 5.00 },
   "roles": {
-    "master": { "provider": "mistral", "model": null },
-    "worker": { "provider": "mistral", "model": null },
+    "master": { "provider": "mock", "model": null },
+    "worker": { "provider": "mock", "model": null },
     "oracle": null
   },
   "providers": {

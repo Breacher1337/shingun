@@ -122,10 +122,10 @@ export async function handleDirective({ provider, directive, ops, statusSnapshot
       ].join('\n')
     }],
     tools: [
-      { type: 'function', function: { name: 'spawn_worker', parameters: { type: 'object', properties: { persona: { type: 'string' }, hint: { type: 'string' } }, required: ['persona'] } } },
-      { type: 'function', function: { name: 'prune_worker', parameters: { type: 'object', properties: { workerId: { type: 'string' }, reason: { type: 'string' } }, required: ['workerId'] } } },
-      { type: 'function', function: { name: 'stop_swarm', parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: [] } } },
-      { type: 'function', function: { name: 'status_report', parameters: { type: 'object', properties: {}, required: [] } } }
+      { type: 'function', function: { name: 'spawn_worker', description: 'Spawn one more worker with a persona and an optional strategy hint.', parameters: { type: 'object', properties: { persona: { type: 'string' }, hint: { type: 'string' } }, required: ['persona'] } } },
+      { type: 'function', function: { name: 'prune_worker', description: 'Stop a running worker by id.', parameters: { type: 'object', properties: { workerId: { type: 'string' }, reason: { type: 'string' } }, required: ['workerId'] } } },
+      { type: 'function', function: { name: 'stop_swarm', description: 'Stop the entire swarm.', parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: [] } } },
+      { type: 'function', function: { name: 'status_report', description: 'Report the current swarm status summary.', parameters: { type: 'object', properties: {}, required: [] } } }
     ],
     meta: { fixture: 'directive', key: 'directive', role: 'master' }
   });

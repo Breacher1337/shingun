@@ -12,7 +12,7 @@ const ROOT = path.resolve(import.meta.dirname, '..');
 
 test('engine: master directive answered via master.chat events', async () => {
   const ws = await fs.mkdtemp(path.join(os.tmpdir(), 'dir-'));
-  const { config, env } = await loadConfig({ file: path.join(ROOT, 'config.json'), profile: 'low-power' });
+  const { config, env } = await loadConfig({ file: path.join(ROOT, 'test', 'fixtures', 'test-config.json'), profile: 'low-power' });
   const bus = createBus();
   const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, ws), env, bus });
 

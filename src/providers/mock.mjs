@@ -7,6 +7,10 @@ import path from 'node:path';
  * Fixture layout: <fixtureDir>/{triage,worker,digest,respawn,directive}.json
  * Each non-triage fixture is { steps: [...] } or a single script object;
  * worker steps are indexed per worker key; usage is reported per call.
+ * When meta.slug is set (challenge basename), `${fixture}.${slug}.json`
+ * takes precedence — that is how the bundled dry-run labs ship tailored
+ * scripted attacks while the generic fixture keeps every other challenge
+ * working offline.
  */
 export function createMock({ fixtureDir, price, scrubber, logSink, name }) {
   const cache = new Map(); // fixtureName -> parsed
@@ -41,7 +45,15 @@ export function createMock({ fixtureDir, price, scrubber, logSink, name }) {
     async chat({ messages, tools, meta = {} }) {
       const clean = scrubber ? scrubber.scrubMessages(messages) : messages;
       await log({ kind: 'mock.outbound', meta, messageCount: (clean ?? []).length, messages: clean });
-      const fixtureName = meta.fixture ?? 'worker';
+      const base = meta.fixture ?? 'worker';
+      const slug = typeof meta.slug === 'string' && /^[\w.-]{1,64}$/.test(meta.slug) ? meta.slug : null;
+      let fixtureName = base;
+      if (slug) {
+        // Challenge-tailored script when one exists; generic otherwise.
+        const tailored = await fs.stat(path.join(fixtureDir, `${base}.${slug}.json`))
+          .then(() => true).catch(() => false);
+        if (tailored) fixtureName = `${base}.${slug}`;
+      }
       const script = await load(fixtureName);
       const key = `${fixtureName}:${meta.key ?? meta.role ?? 'default'}`;
       const step = nextStep(script, key);

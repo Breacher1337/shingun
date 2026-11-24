@@ -86,6 +86,20 @@ export async function loadConfig({ file = './config.json', profile, envFile = '.
   let fileData = {};
   if (await fs.stat(file).then(() => true).catch(() => false)) {
     fileData = JSON.parse(await fs.readFile(file, 'utf8'));
+    // Common hand-written shape: top-level master/worker/oracle objects
+    // instead of the nested roles map. Fold them in instead of rejecting —
+    // the operator's intent is unambiguous.
+    const LEGACY_ROLES = ['master', 'worker', 'oracle'];
+    const legacy = LEGACY_ROLES.filter((k) => k in fileData);
+    if (legacy.length) {
+      fileData.roles ?? (fileData.roles = {});
+      for (const k of legacy) {
+        if (fileData.roles[k] === undefined) {
+          fileData.roles[k] = typeof fileData[k] === 'string' ? { provider: fileData[k] } : fileData[k];
+        }
+        delete fileData[k];
+      }
+    }
     for (const key of Object.keys(fileData)) {
       if (!KNOWN_KEYS.has(key)) {
         throw Object.assign(new Error(`config.json: unknown key "${key}"`), { code: 'config_invalid' });

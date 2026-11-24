@@ -35,6 +35,7 @@ export async function runWorker({
   workerId,
   swarmId,
   challengeId,
+  challengeSlug = null,
   persona,
   strategyPrompt,
   digestText,
@@ -83,6 +84,7 @@ export async function runWorker({
       const userMsg = { role: 'user', content: `Operator steering note: ${note}` };
       messages.push(userMsg);
       await writeTranscript(userMsg);
+      emit('worker.log', { stream: 'transcript', seq: messages.length, text: `operator steering: ${note}` });
     }
 
     const estTokens = Math.ceil(messages.reduce((n, m) => n + String(m.content ?? '').length, 0) / 4);
@@ -98,7 +100,7 @@ export async function runWorker({
       res = await provider.chat({
         messages,
         tools: TOOL_SCHEMAS,
-        meta: { fixture: 'worker', key: workerId, role: 'worker' }
+        meta: { fixture: 'worker', key: workerId, role: 'worker', ...(challengeSlug ? { slug: challengeSlug } : {}) }
       });
     } catch (e) {
       emit('worker.log', { stream: 'transcript', seq: messages.length, text: `provider error: ${e.message}` });

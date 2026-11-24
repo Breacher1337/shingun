@@ -5,6 +5,9 @@ import zlib from 'node:zlib';
 import path from 'node:path';
 import { tmpWorkspace, runCli, FIXTURE } from './helpers.mjs';
 
+const ROOT = path.resolve(import.meta.dirname, '..');
+const TEST_CONFIG = path.join(ROOT, 'test', 'fixtures', 'test-config.json');
+
 /** Minimal USTAR reader with checksum verification — the extraction proof. */
 function parseTar(buf) {
   const entries = [];
@@ -26,7 +29,7 @@ function parseTar(buf) {
 }
 
 async function runOneSolvedSwarm(ws) {
-  const run = await runCli(['run', FIXTURE, '--workspace', ws, '--challenge-id', 'bundle-src'], { timeoutMs: 120000 });
+  const run = await runCli(['run', FIXTURE, '--config', TEST_CONFIG, '--workspace', ws, '--challenge-id', 'bundle-src'], { timeoutMs: 120000 });
   assert.equal(run.code, 0, `CLI run exited clean: ${run.stderr.slice(0, 400)}`);
   const sid = run.events[0]?.swarm;
   assert.ok(sid, 'run emitted at least one event');
@@ -39,7 +42,7 @@ test('acceptance 3a: review bundle extracts with the full write-up set', async (
   try {
     const { sid } = await runOneSolvedSwarm(ws);
 
-    const out = await runCli(['bundle', sid, '--workspace', ws], { timeoutMs: 60000 });
+    const out = await runCli(['bundle', sid, '--config', TEST_CONFIG, '--workspace', ws], { timeoutMs: 60000 });
     assert.equal(out.code, 0, `bundle exited clean: ${out.stderr.slice(0, 400)}`);
     const payload = out.events[0];
     assert.ok(payload?.path, 'bundle reported its output path');
@@ -90,7 +93,7 @@ test('acceptance 3a: review bundle extracts with the full write-up set', async (
 test('acceptance 3a-2: bundle refuses unknown and non-terminal swarms', async () => {
   const ws = await tmpWorkspace('bundle-err-');
   try {
-    const unknown = await runCli(['bundle', 'sw-nope', '--workspace', ws], { timeoutMs: 30000 });
+    const unknown = await runCli(['bundle', 'sw-nope', '--config', TEST_CONFIG, '--workspace', ws], { timeoutMs: 30000 });
     assert.notEqual(unknown.code, 0, 'unknown swarm is a hard error');
     assert.match(unknown.stderr, /unknown swarm|error/i);
 
@@ -101,7 +104,7 @@ test('acceptance 3a-2: bundle refuses unknown and non-terminal swarms', async ()
     await fs.writeFile(path.join(evDir, 'sw-ghost.jsonl'),
       JSON.stringify({ v: 1, id: 'sw-ghost-00001', t: new Date().toISOString(), type: 'swarm.update', challenge: 'ch-never-ends', swarm: 'sw-ghost', worker: null, data: { status: 'running' } }) + '\n',
       'utf8');
-    const early = await runCli(['bundle', 'sw-ghost', '--workspace', ws], { timeoutMs: 30000 });
+    const early = await runCli(['bundle', 'sw-ghost', '--config', TEST_CONFIG, '--workspace', ws], { timeoutMs: 30000 });
     assert.notEqual(early.code, 0, 'non-terminal swarm refuses bundling');
     assert.match(early.stderr, /not terminal/i);
   } finally {
@@ -113,7 +116,7 @@ test('acceptance 3a-3: `shingun status` reads swarm state off disk', async () =>
   const ws = await tmpWorkspace('status-');
   try {
     const { sid } = await runOneSolvedSwarm(ws);
-    const st = await runCli(['status', '--workspace', ws], { timeoutMs: 60000 });
+    const st = await runCli(['status', '--config', TEST_CONFIG, '--workspace', ws], { timeoutMs: 60000 });
     assert.equal(st.code, 0);
     const lines = st.events; // stdout is JSONL, so helpers' event parse doubles as line parse
     const mine = lines.find((l) => l.swarmId === sid);
