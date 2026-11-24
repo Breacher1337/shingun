@@ -856,6 +856,7 @@ function showKeyCard(missing, roles) {
         roleUser
           ? 'A role already points at this provider, but its API key is missing — swarms against it cannot run. paste the key to continue.'
           : 'this provider is configured but has no API key yet. paste one and activate it for the master + worker roles, or keep the keyless mock provider.'),
+      h('p', { class: 'dim' }, 'This is the model provider\u2019s API key (e.g. the Mistral console key). It is NOT the dashboard access token \u2014 nothing entered here unlocks the page.'),
       h('label', { class: 'krow' }, 'provider', select),
       h('label', { class: 'krow' }, 'api key', input),
       h('label', { class: 'krow kcheck' }, activate, 'use this provider for master + worker'),

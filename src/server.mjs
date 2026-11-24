@@ -301,18 +301,29 @@ export async function startServer({
 
   // A bare 401 that doubles as the operator's entry point: browsers cannot
   // attach Authorization headers to address-bar navigations, so the page
-  // offers the tokenized URL form. No engine data lives in this response.
+  // offers the tokenized URL form. Validation round-trips through an
+  // authorized static request, and a wrong token gets explicit feedback —
+  // no engine data lives in this response.
   function gatePage(res) {
     res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
     res.end(`<!doctype html><html><head><meta charset="utf-8"><title>shingun</title>
 <style>body{background:#0b0d10;color:#d7e0e8;font:14px/1.5 ui-monospace,Consolas,monospace;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
-form{background:#11151a;border:1px solid #1d232b;padding:24px;border-radius:8px;width:340px}
-h1{font-size:15px;margin:0 0 6px;letter-spacing:.08em}.hint{color:#7d8a96;margin:0 0 14px;font-size:12px}
-input{width:100%;box-sizing:border-box;background:#0b0d10;color:#d7e0e8;border:1px solid #1d232b;border-radius:4px;padding:8px;font:inherit}
-button{margin-top:10px;width:100%;padding:8px;border:0;border-radius:4px;background:#2b6cb0;color:#fff;font:inherit;cursor:pointer}
-</style></head><body><form onsubmit="location='/?token='+encodeURIComponent(document.getElementById('t').value);return false">
-<h1>shingun</h1><p class="hint">This dashboard requires its bearer token. Open the URL printed by <code>shingun serve</code>, or paste the token:</p>
-<input id="t" placeholder="SHINGUN_TOKEN" autofocus><button type="submit">open dashboard</button></form></body></html>`);
+form{background:#11151a;border:1px solid #1d232b;padding:24px;border-radius:8px;width:380px}
+h1{font-size:15px;margin:0 0 6px;letter-spacing:.08em}.hint{color:#7d8a96;margin:0 0 10px;font-size:12px}
+.notkey{color:#ffb454;font-size:11px;margin:0 0 14px;padding:6px 8px;border:1px solid #6b4a26;border-radius:4px;background:rgba(107,74,38,.12)}
+label{display:block;font-size:11px;color:#7d8a96;margin-top:14px}
+input{width:100%;box-sizing:border-box;background:#0b0d10;color:#d7e0e8;border:1px solid #1d232b;border-radius:4px;padding:8px;font:inherit;margin-top:4px}
+button{width:100%;margin-top:14px;padding:8px;border:0;border-radius:4px;background:#2b6cb0;color:#fff;font:inherit;cursor:pointer}
+button:disabled{background:#161b21;color:#4a5560;cursor:wait}
+.error{color:#ff8c42;font-size:12px;margin-top:10px;min-height:16px}
+</style></head><body><form id="gt-form" onsubmit="return false">
+<h1>shingun</h1>
+<p class="hint">This page needs the dashboard <b>access token</b> — not a model provider API key.</p>
+<p class="notkey">Paste the token from the <code>dashboard:</code> URL that <code>shingun serve</code> prints (also in the repo\u2019s <code>.env</code> as <code>SHINGUN_TOKEN</code>).</p>
+<label for="t">access token</label>
+<input id="t" placeholder="SHINGUN_TOKEN" autocomplete="off" autofocus>
+<div class="error" id="e"></div>
+<button id="gt-button" type="button" onclick="(function(){var b=document.getElementById('gt-button');b.disabled=true;var e=document.getElementById('e');e.textContent='';fetch('/style.css',{headers:{Authorization:'Bearer '+document.getElementById('t').value.trim()}}).then(function(r){b.disabled=false;if(r.ok){localStorage.setItem('shingun.token',document.getElementById('t').value.trim());location=location.pathname;}else{e.textContent='token rejected — check SHINGUN_TOKEN in .env';}}).catch(function(){b.disabled=false;e.textContent='could not reach the server — is shingun serve running?';});})()">open dashboard</button></form></body></html>`);
   }
 
   // -- SSE ---------------------------------------------------------------
