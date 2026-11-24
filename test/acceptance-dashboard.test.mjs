@@ -42,7 +42,9 @@ async function waitFor(fn, timeoutMs, everyMs = 100) {
 
 async function boot() {
   const ws = await tmpWorkspace('dash-');
-  const { config, env } = await loadConfig({ file: TEST_CONFIG, profile: 'low-power' });
+  // Hermetic: read the env file from the temp workspace, not the operator's
+  // ROOT .env — an operator token there would gate this "open workspace" test.
+  const { config, env } = await loadConfig({ file: TEST_CONFIG, profile: 'low-power', envFile: path.join(ws, '.env') });
   const bus = createBus();
   const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, ws), env: { ...env }, bus });
   const srv = await startServer({

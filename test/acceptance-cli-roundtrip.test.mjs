@@ -17,7 +17,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function writePortConfig(ws) {
   const port = 28000 + Math.floor(Math.random() * 2001);
   const file = path.join(ws, 'relay-config.json');
-  await fs.writeFile(file, JSON.stringify({ port }, null, 2) + '\n', 'utf8');
+  await fs.writeFile(file, JSON.stringify({
+    port,
+    // Hermetic admission: the fixture meminfo spares the relayed serve runs
+    // from the host's real watermark (they would stall in spawn otherwise).
+    admission: { meminfoPath: path.join(ROOT, 'test', 'fixtures', 'meminfo-ok') }
+  }, null, 2) + '\n', 'utf8');
   return { port, file };
 }
 

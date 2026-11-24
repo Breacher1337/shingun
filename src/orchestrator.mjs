@@ -382,10 +382,15 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
   async function directive(swarmId, text) {
     const s = swarms.get(swarmId);
     if (!s) throw Object.assign(new Error(`unknown swarm ${swarmId}`), { code: 'swarm_unknown' });
-    if (['solved', 'stopped'].includes(s.status)) {
-      return { reply: 'Swarm is already terminal.', actions: [] };
-    }
     const emit = s.emit;
+    if (['solved', 'stopped'].includes(s.status)) {
+      // Terminal swarms still answer: the exchange persists to the deck so a
+      // relayed directive never vanishes from the operator's chat history.
+      const reply = 'Swarm is already terminal.';
+      await emit('master.chat', { direction: 'user', text });
+      await emit('master.chat', { direction: 'master', text: reply, actions: [] });
+      return { reply, actions: [] };
+    }
     await emit('master.chat', { direction: 'user', text });
     const masterProvider = getProviderFor('master');
     const out = await handleDirective({

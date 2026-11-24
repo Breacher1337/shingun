@@ -19,7 +19,9 @@ const TEST_CONFIG = path.join(ROOT, 'test', 'fixtures', 'test-config.json');
 
 async function boot({ token = null } = {}) {
   const ws = await tmpWorkspace('style-');
-  const { config, env } = await loadConfig({ file: TEST_CONFIG, profile: 'low-power' });
+  // Hermetic: read the env file from the temp workspace, not the operator's
+  // ROOT .env — an operator token there would gate this "open workspace" test.
+  const { config, env } = await loadConfig({ file: TEST_CONFIG, profile: 'low-power', envFile: path.join(ws, '.env') });
   const merged = { ...env, ...(token ? { SHINGUN_TOKEN: token } : {}) };
   const bus = createBus();
   const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, ws), env: merged, bus });
