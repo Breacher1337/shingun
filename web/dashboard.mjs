@@ -33,7 +33,7 @@ const qs = new URLSearchParams(location.search);
     history.replaceState({}, '', location.pathname);
   }
 }
-const TOKEN = localStorage.getItem('shingun.token'); // '' → the server's 401 page shows the gate
+const TOKEN = localStorage.getItem('shingun.token'); // only used when the server opts into gating
 
 // ---- api ------------------------------------------------------------------
 
@@ -41,7 +41,7 @@ async function api(path, { method = 'GET', body } = {}) {
   const res = await fetch(path, {
     method,
     headers: {
-      Authorization: `Bearer ${TOKEN}`,
+      ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
       ...(body !== undefined ? { 'Content-Type': 'application/json' } : {})
     },
     body: body !== undefined ? JSON.stringify(body) : undefined
@@ -137,7 +137,8 @@ function topbar() {
       h('input', { id: 'tb-swarm-input', placeholder: 'swarm id', spellcheck: 'false' }),
       h('button', { onclick: () => connectSwarm($('#tb-swarm-input').value.trim()) }, 'connect')
     ),
-    h('button', { id: 'tb-new', onclick: openChallengeModal }, '+ challenge')
+    h('button', { id: 'tb-new', onclick: openChallengeModal }, '+ challenge'),
+    h('button', { id: 'tb-settings', onclick: openSettings }, 'settings')
   ];
 }
 
@@ -689,7 +690,7 @@ async function startSse(swarmId) {
   for (;;) {
     try {
       const res = await fetch(`/api/events?swarm=${encodeURIComponent(swarmId)}`, {
-        headers: { Authorization: `Bearer ${TOKEN}` },
+        headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {},
         signal
       });
       if (!res.ok || !res.body) throw new Error(`events stream ${res.status}`);
@@ -771,6 +772,87 @@ async function connectSwarm(swarmId) {
   if (!swarmId) return;
   const ok = await loadSwarm(swarmId);
   if (!ok) toast(`could not load swarm ${swarmId} — check the id`, 'warn');
+}
+
+// ---- settings ----------------------------------------------------------------
+
+/** Set or rotate a provider API key at any time (OpenAI-compatible lanes). */
+async function openSettings() {
+  if ($('#settings-modal')) return;
+  const modal = h('div', { class: 'overlay' },
+    h('div', { class: 'modal', id: 'settings-modal' }, h('h2', null, 'Settings'),
+      h('div', { class: 'kv' }, 'scanning providers…')));
+  app.append(modal);
+  const info = await api('/api/providers').catch((e) => null);
+  if (!modal.isConnected) return; // closed while scanning
+  if (!info) {
+    modal.remove();
+    toast('provider scan failed — is the server running?', 'warn');
+    return;
+  }
+  renderSettings(modal, info);
+}
+
+function renderSettings(modal, info, preferName) {
+  const keyable = Object.entries(info.providers ?? {}).filter(([, p]) => p.type === 'openai-compat' && p.apiKeyEnv);
+  if (!keyable.length) {
+    modal.replaceChildren(
+      h('div', { class: 'modal', id: 'settings-modal' }, h('h2', null, 'Settings'),
+        h('div', { class: 'kv' }, 'no keyable providers are configured in config.json'),
+        h('div', { class: 'btns' }, h('button', { onclick: () => modal.remove() }, 'close'))));
+    return;
+  }
+  const roles = info.roles ?? {};
+  const chips = Object.entries(info.providers ?? {}).map(([n, p]) =>
+    h('span', { class: `act ${p.hasKey ? 'ok' : 'bad'}`, title: n },
+      `${n}: ${p.hasKey === null ? 'keyless by design' : p.hasKey ? 'key set' : 'key missing'}`));
+  const selected = keyable.some(([n]) => n === preferName) ? preferName : keyable[0][0];
+  const select = h('select', { id: 'st-prov', class: 'kinput',
+    onchange: (e) => renderSettings(modal, info, e.target.value) },
+    keyable.map(([n]) => h('option', { value: n, selected: n === selected }, n)));
+  const prov = info.providers[selected];
+  const input = h('input', { id: 'st-key', class: 'kinput', type: 'password',
+    placeholder: prov.apiKeyEnv ?? 'API key', autocomplete: 'off', spellcheck: 'false' });
+  const roleUsesIt = roles.master?.provider === selected || roles.worker?.provider === selected;
+  const activate = h('input', { type: 'checkbox' });
+  activate.checked = roleUsesIt;
+  // Protect the in-flight key text across the selection re-render.
+  const prevKey = modal.querySelector('#st-key')?.value ?? '';
+  input.value = prevKey;
+  const err = h('div', { class: 'kerr' });
+  const roleLine = `master: ${roles.master?.provider ?? '—'} · worker: ${roles.worker?.provider ?? '—'}`;
+
+  const body = h('div', { class: 'modal', id: 'settings-modal' },
+    h('h2', null, 'Settings'),
+    h('div', { class: 'acts' }, ...chips),
+    h('label', { class: 'krow' }, 'provider', select),
+    h('label', { class: 'krow' }, 'api key', input),
+    h('label', { class: 'krow kcheck' }, activate, `use ${selected} for master + worker`),
+    h('p', { class: 'dim', style: 'margin:2px 0 6px;color:var(--dim);font-size:12px' },
+      'The pasted key applies immediately and overwrites the stored one. Roles now: ' + roleLine + '.'),
+    err,
+    h('div', { class: 'btns' },
+      h('button', {
+        class: 'primary', onclick: async () => {
+          err.replaceChildren();
+          const key = input.value.trim();
+          if (!key) { err.replaceChildren('paste a key first'); return; }
+          try {
+            const res = await api('/api/provider-key', {
+              method: 'POST', body: { provider: selected, apiKey: key, activate: activate.checked }
+            });
+            toast(`key saved for ${res.provider}${res.activated ? ' — roles activated' : ''}`, 'flag', 12000);
+            const fresh = await api('/api/providers');
+            renderSettings(modal, fresh, selected);
+            checkProviders(); // sync the boot card with the new state
+          } catch (e) {
+            err.replaceChildren(`save failed: ${e.message}`);
+          }
+        }
+      }, 'save key'),
+      h('button', { onclick: () => modal.remove() }, 'close')));
+
+  modal.replaceChildren(body);
 }
 
 // ---- challenge launcher ------------------------------------------------------
@@ -896,13 +978,8 @@ paintTopbar();
 paintTiles();
 renderHero();
 
-if (!TOKEN) {
-  // Static assets are token-gated server-side; landing here without one
-  // means the bearer gate showed instead. Nothing to boot.
-} else {
-  const last = localStorage.getItem('shingun.lastSwarm');
-  if (last) {
-    loadSwarm(last).then((ok) => { if (!ok) localStorage.removeItem('shingun.lastSwarm'); });
-  }
-  checkProviders();
+const last = localStorage.getItem('shingun.lastSwarm');
+if (last) {
+  loadSwarm(last).then((ok) => { if (!ok) localStorage.removeItem('shingun.lastSwarm'); });
 }
+checkProviders();

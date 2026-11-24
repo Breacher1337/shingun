@@ -3,6 +3,7 @@ import assert from 'node:assert';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { loadConfig, resolveWorkspace } from '../src/config.mjs';
 import { createBus } from '../src/bus.mjs';
@@ -153,6 +154,59 @@ test('acceptance 2a: server boots and gates everything behind the token', async 
     assert.equal(ctx.srv.server.address().address, '127.0.0.1');
   } finally {
     await teardown(ctx);
+  }
+});
+
+test('acceptance 2a-2: without SHINGUN_TOKEN the workspace is open — and host-guarded', async () => {
+  const ws = await tmpWorkspace('open-');
+  const { config, env } = await loadConfig({ file: path.join(ROOT, 'config.json'), profile: 'low-power' });
+  const openedEnv = { ...env };
+  delete openedEnv.SHINGUN_TOKEN;
+  const bus = createBus();
+  const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, ws), env: openedEnv, bus });
+  const srv = await startServer({
+    config, env: openedEnv, orchestrator: orch, bus, workspaceDir: ws,
+    envFile: path.join(ws, '.env'), webDir: path.join(ROOT, 'web')
+  });
+  try {
+    await srv.listen(0);
+    assert.equal(srv.gated, false, 'no token in env means open mode');
+    assert.ok(!srv.dashboardUrl.includes('token='), 'no token is minted or printed');
+    const base = `http://127.0.0.1:${srv.server.address().port}`;
+
+    // The shell serves bare: no gate page, no token dance.
+    const shell = await fetch(base + '/');
+    assert.equal(shell.status, 200);
+    assert.match(await shell.text(), /dashboard\.mjs/);
+
+    // Data routes answer without any Authorization header.
+    const providers = await fetch(base + '/api/providers');
+    assert.equal(providers.status, 200);
+    const info = await providers.json();
+    assert.ok(info.providers && info.roles, 'provider scan open');
+
+    // The rebinding substitute: foreign Host names are refused outright.
+    const forbidden = await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1', port: srv.server.address().port, path: '/api/providers',
+        headers: { Host: 'evil.example' }
+      }, (res) => {
+        res.resume();
+        resolve(res.statusCode);
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    assert.equal(forbidden, 403, 'a rebinding hostname never reaches a route');
+  } finally {
+    await srv.close();
+    for (const s of orch.swarms.values()) {
+      for (let i = 0; i < 200; i++) {
+        if ([...s.workers.values()].every((w) => w.closed || w.isReservation)) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    }
+    fs.rm(ws, { recursive: true, force: true }).catch(() => {});
   }
 });
 
@@ -367,16 +421,23 @@ test('acceptance 2d: `shingun serve` boots the real CLI surface', async () => {
         }
       }, 100);
     });
-    assert.match(dashboardUrl, /^http:\/\/127\.0\.0\.1:\d+\/\?token=/);
+    assert.match(dashboardUrl, /^http:\/\/127\.0\.0\.1:\d+\/(\?token=\S+)?$/);
 
     const dash = await fetch(dashboardUrl);
     assert.equal(dash.status, 200);
     assert.match(await dash.text(), /shingun/);
 
-    // Same host without the token: still gated.
-    const gate = await fetch(new URL('/', dashboardUrl));
-    assert.equal(gate.status, 401);
-    await gate.body.cancel().catch(() => {});
+    // Gated and open serves both pass this smoke; branch on what booted.
+    if (dashboardUrl.includes('token=')) {
+      const gate = await fetch(new URL('/', dashboardUrl));
+      assert.equal(gate.status, 401, 'gated serve refuses the bare shell');
+      await gate.body.cancel().catch(() => {});
+    } else {
+      const bare = await fetch(new URL('/', dashboardUrl));
+      assert.equal(bare.status, 200, 'open serve answers the bare shell');
+      const providers = await fetch(new URL('/api/providers', dashboardUrl));
+      assert.equal(providers.status, 200, 'open serve answers data routes without auth');
+    }
   } finally {
     child.kill('SIGKILL');
     child.stdout.destroy?.();

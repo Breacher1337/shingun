@@ -58,18 +58,21 @@ async function statusScan(workspaceDir) {
 async function serveRelay(method, routePath, body, config, env) {
   const base = `http://127.0.0.1:${config.port}`;
   const token = env?.SHINGUN_TOKEN;
-  if (!token) {
-    throw Object.assign(new Error('no running serve process is reachable and no SHINGUN_TOKEN is configured'), { code: 'serve_unreachable' });
-  }
   let res;
   try {
     res = await fetch(base + routePath, {
       method,
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        'Content-Type': 'application/json'
+      },
       body: body !== undefined ? JSON.stringify(body) : undefined
     });
   } catch {
     throw Object.assign(new Error(`no shingun serve process on ${base}`), { code: 'serve_unreachable' });
+  }
+  if (res.status === 401) {
+    throw Object.assign(new Error('the serve process is token-gated; set SHINGUN_TOKEN in .env'), { code: 'serve_gated' });
   }
   const payload = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -260,10 +263,10 @@ async function main() {
       });
       await srv.listen(port);
       process.stdout.write(`shingun (進軍) serving on ${srv.url}\n`);
-      if (srv.tokenGenerated) {
-        process.stdout.write(`generated bearer token and saved it to ${path.join(HERE, '.env')}\n`);
-      }
       process.stdout.write(`dashboard: ${srv.dashboardUrl}\n`);
+      process.stdout.write(srv.gated
+        ? `auth: token-gated (SHINGUN_TOKEN from .env)\n`
+        : `auth: open workspace (set SHINGUN_TOKEN in .env to gate this dashboard)\n`);
       if (resumed.length) {
         process.stdout.write(`resumed swarms (in-flight before restart): ${resumed.join(', ')}\n`);
       }

@@ -1,7 +1,6 @@
 import http from 'node:http';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { randomBytes } from 'node:crypto';
 import { ingestChallenge } from './ingest.mjs';
 import { listTree, nowIso, writeJson } from './util.mjs';
 
@@ -106,20 +105,26 @@ export async function startServer({
     }
   }
 
-  // Gate credential: from .env, or generated (and persisted) on first serve.
-  let token = env?.SHINGUN_TOKEN;
-  let tokenGenerated = false;
-  if (!token) {
-    token = randomBytes(16).toString('hex');
-    tokenGenerated = true;
-    if (envFile) {
-      await fs.appendFile(envFile, `SHINGUN_TOKEN=${token}\n`, 'utf8').catch(() => {});
-    }
-  }
+  // Access is OPEN by default: a localhost workspace for one operator should
+  // not carry a bearer gate. Setting SHINGUN_TOKEN in .env opts back into
+  // gating (header or ?token= on the shell); nothing is ever auto-generated.
+  const token = env?.SHINGUN_TOKEN || null;
+  const gated = Boolean(token);
 
   const authorize = (req) => {
+    if (!gated) return true;
     const got = req.headers.authorization ?? '';
     return got === `Bearer ${token}`;
+  };
+
+  // DNS-rebinding guard: the browser (or any client) must address this
+  // service by its loopback name, never through a foreign hostname that
+  // happens to resolve to 127.0.0.1.
+  const LOCAL_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]']);
+  const loopbackNamed = (req) => {
+    const host = String(req.headers.host ?? '');
+    const name = host.replace(/:\d+$/, '').toLowerCase();
+    return LOCAL_HOSTNAMES.has(name);
   };
 
   // -- filesystem helpers ------------------------------------------------
@@ -382,15 +387,21 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
   // -- request handler ---------------------------------------------------
 
   async function handle(req, res) {
+    // Rebinding guard first: foreign hostnames never reach a route.
+    if (!loopbackNamed(req)) {
+      sendJson(res, 403, { error: { code: 'host_forbidden', message: 'this service answers only to its loopback name' } });
+      return;
+    }
     const url = new URL(req.url, `http://127.0.0.1:${config.port}`);
     const pathname = url.pathname;
 
     // Static shell accepts the token in the query as well: an address-bar
-    // navigation cannot carry headers. Data routes below never do.
+    // navigation cannot carry headers. Data routes below never do. Without
+    // a configured token the workspace is simply open.
     const queryToken = url.searchParams.get('token');
     const staticEntry = STATIC_FILES[pathname];
     if (staticEntry) {
-      if (authorize(req) || (queryToken && queryToken === token)) return serveStatic(res, staticEntry);
+      if (authorize(req) || (gated && queryToken && queryToken === token)) return serveStatic(res, staticEntry);
       return gatePage(res);
     }
 
@@ -646,9 +657,9 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
   return {
     server,
     token,
-    tokenGenerated,
+    gated,
     get url() { return `http://127.0.0.1:${config.port}/`; },
-    get dashboardUrl() { return `http://127.0.0.1:${config.port}/?token=${token}`; },
+    get dashboardUrl() { return gated ? `http://127.0.0.1:${config.port}/?token=${token}` : `http://127.0.0.1:${config.port}/`; },
     listen,
     close
   };
