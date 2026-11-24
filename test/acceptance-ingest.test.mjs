@@ -5,6 +5,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { randomBytes } from 'node:crypto';
+import { buildZip } from './fixtures/zip-fixture.mjs';
 import { ingestChallenge, targetMarkdown } from '../src/ingest.mjs';
 import { workerSystemPrompt } from '../src/worker.mjs';
 import { loadConfig, resolveWorkspace } from '../src/config.mjs';
@@ -81,16 +82,52 @@ test('ingest: download stores a single plain file as the artifact', async () => 
   }
 });
 
-test('ingest: zip is refused by name and the fix is stated', async () => {
+test('ingest: zip extracts — a CRC-verified local-header walk, no more refusal', async () => {
   const dir = await ws();
-  const { srv, url } = await serveOnce({ '/bundle.zip': Buffer.from([0x50, 0x4b, 0x03, 0x04]) });
+  const { srv, url } = await serveOnce({
+    '/pico.zip': buildZip([
+      ['README.md', '# picocrypt\nthe flag format is picoCTF{...}\n'],
+      ['src/enc.py', 'print("x")\n']
+    ])
+  });
   try {
+    const ing = await ingestChallenge({ source: 'download', value: url('/pico.zip'), challengesDir: dir });
+    const read = await fs.readFile(path.join(ing.baseDir, 'README.md'), 'utf8');
+    assert.match(read, /picocrypt/);
+    const py = await fs.readFile(path.join(ing.baseDir, 'src/enc.py'), 'utf8');
+    assert.match(py, /print/);
+    assert.ok(await fs.stat(path.join(ing.baseDir, '.git')).then(() => true).catch(() => false), 'git-normalized base');
+
+    // A corrupted byte anywhere in stored data must fail its CRC check.
+    const badZip = Buffer.from(buildZip([['evil.txt', 'payload that will be corrupted']]));
+    badZip[badZip.length - 4] ^= 0xFF;
     await assert.rejects(
-      () => ingestChallenge({ source: 'download', value: url('/bundle.zip'), challengesDir: dir }),
-      (e) => e.code === 'ingest_zip_unsupported' && /tar\.gz/i.test(e.message)
+      () => ingestChallenge({ source: 'upload', value: { data: badZip, filename: 'bad.zip' }, challengesDir: dir }),
+      (e) => e.code === 'ingest_zip_corrupt' && /CRC/.test(e.message)
+    );
+
+    // Zip-slip: an entry escaping the root is refused by name.
+    const slip = buildZip([['../escape.txt', 'nope']]);
+    await assert.rejects(
+      () => ingestChallenge({ source: 'upload', value: { data: slip, filename: 'slip.zip' }, challengesDir: dir }),
+      (e) => e.code === 'ingest_zip_corrupt' && /escapes the archive root/.test(e.message)
     );
   } finally {
     srv.close();
+    fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('ingest: a downloaded picoCTF zip lands via the CLI path too', async () => {
+  const dir = await ws();
+  try {
+    const file = path.join(dir, 'pico-dl.zip');
+    await fs.writeFile(file, buildZip([['chal/challenge.py', 'flag = "picoCTF{local}"\n']]));
+    const ing = await ingestChallenge({ source: 'path', value: file, challengesDir: dir });
+    const read = await fs.readFile(path.join(ing.baseDir, 'chal/challenge.py'), 'utf8');
+    assert.match(read, /picoCTF\{local\}/);
+    assert.ok(await fs.stat(path.join(ing.baseDir, '.git')).then(() => true).catch(() => false), 'normalized');
+  } finally {
     fs.rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 });
@@ -183,6 +220,48 @@ test('api: POST /api/v1/challenges accepts a pure live-web target challenge', as
       method: 'POST', body: { target: { url: 'not-a-url' } }
     });
     assert.equal(bad.status, 400);
+  } finally {
+    await srv.close();
+    fs.rm(wr, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('api: POST /api/v1/challenges accepts a raw zip upload (the picoCTF door)', async () => {
+  const wr = await tmpWorkspace('ingest-upload-');
+  const loaded = await loadConfig({ file: path.join(ROOT, 'test', 'fixtures', 'test-config.json'), profile: 'low-power' });
+  const config = structuredClone(loaded.config);
+  config.roles = { master: { provider: 'mock' }, worker: { provider: 'mock' }, oracle: null };
+  const bus = createBus();
+  const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, wr), env: { ...loaded.env }, bus });
+  const srv = await startServer({
+    config, env: { ...loaded.env }, orchestrator: orch, bus,
+    workspaceDir: wr, envFile: path.join(wr, '.env'),
+    webDir: path.join(ROOT, 'web'), configFile: path.join(wr, 'config.json')
+  });
+  await srv.listen(0);
+  const base = `http://127.0.0.1:${srv.server.address().port}`;
+  const zipBytes = buildZip([
+    ['README.md', '# picocrypt\n'],
+    ['enc.py', 'flag = "picoCTF{uploaded}"\n']
+  ]);
+  try {
+    const res = await fetch(`${base}/api/v1/challenges?title=picocrypt&hint=vigenere&target=${encodeURIComponent('http://127.0.0.1:8000/c/sqli/')}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/zip', 'x-shingun-filename': 'picocrypt.zip' },
+      body: zipBytes
+    });
+    assert.equal(res.status, 201, 'raw upload registers a challenge');
+    const out = await res.json();
+    assert.equal(out.filename, 'picocrypt.zip');
+    assert.ok(out.uploadedBytes === zipBytes.length);
+    assert.ok(out.fileCount >= 2, 'zip entries extracted');
+
+    const meta = await fetch(`${base}/api/v1/challenges/${out.challengeId}`).then((r) => r.json());
+    assert.equal(meta.title, 'picocrypt');
+    assert.equal(meta.sourceValue, 'picocrypt.zip');
+    assert.equal(meta.sourceType, 'upload');
+    assert.equal(meta.target.url, 'http://127.0.0.1:8000/c/sqli/');
+    assert.equal(meta.hint, 'vigenere');
   } finally {
     await srv.close();
     fs.rm(wr, { recursive: true, force: true }).catch(() => {});

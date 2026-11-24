@@ -425,6 +425,27 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
 
   // -- request handler ---------------------------------------------------
 
+const DEFAULT_INGEST_MAX_BYTES = 256 * 1024 * 1024;
+
+/** Read a body as raw capped bytes (the upload posture). */
+function readRawBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let received = 0;
+    req.on('data', (chunk) => {
+      received += chunk.length;
+      if (received > maxBytes) {
+        req.destroy();
+        reject(httpError('ingest_too_large', `upload exceeds the ${Math.round(maxBytes / 1024 / 1024)}MB ingest cap`));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', (e) => reject(e));
+  });
+}
+
   async function handle(req, res) {
     // Rebinding guard first: foreign hostnames never reach a route.
     if (!loopbackNamed(req)) {
@@ -566,27 +587,58 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
         const cached = idempotencyCache.get(idemKey);
         return sendJson(res, cached.status, cached.body, cached.headers);
       }
-      const body = await readJsonBody(req);
+      // Two postures on one route: the JSON contract (source/target) and
+      // the raw upload — a web dashboard's file picker POSTs the challenge
+      // itself (a zip, a tar.gz, any artifact) as the body, with metadata
+      // riding query params. Same caps, same metadata, same 201.
+      const contentType = String(req.headers['content-type'] ?? '');
+      let body;
+      let uploadInfo = null;
+      if (!/json/i.test(contentType)) {
+        const q = new URL(req.url, `http://127.0.0.1:${config.port}`).searchParams;
+        const cap = Math.min(1024 * 1024 * 1024, DEFAULT_INGEST_MAX_BYTES);
+        const data = await readRawBody(req, cap);
+        const disposition = String(req.headers['content-disposition'] ?? '');
+        const cdName = /filename="([^"]+)"/.exec(disposition)?.[1];
+        const filename = String(req.headers['x-shingun-filename'] ?? cdName ?? 'upload.bin').replace(/[\\/:*?"<>|]/g, '_');
+        const rawTarget = q.get('target');
+        const target = rawTarget
+          ? { url: rawTarget, ...(q.get('targetNote') ? { note: q.get('targetNote') } : {}) }
+          : null;
+        body = {
+          source: data ? 'upload' : (target ? 'none' : undefined),
+          value: data ? { data, filename } : '',
+          title: q.get('title') ?? undefined,
+          hint: q.get('hint') ?? undefined,
+          flagFormatRegex: q.get('flagFormatRegex') ?? undefined,
+          categoryHint: q.get('categoryHint') ?? undefined,
+          maxBytes: cap,
+          target
+        };
+        uploadInfo = { bytes: data?.length ?? 0, filename };
+      } else {
+        body = await readJsonBody(req);
+      }
       const target = body.target === undefined || body.target === null ? null : body.target;
       if (target !== null && (typeof target !== 'object' || !/^https?:\/\/.+/i.test(String(target.url ?? '').trim()))) {
         throw httpError('bad_request', 'target must be {url, note?} with an http(s) url — the live service the challenge runs at');
       }
-      const allowedSources = ['url', 'path', 'download', 'none'];
+      const allowedSources = ['url', 'path', 'download', 'upload', 'none'];
       if (target && body.source === undefined) {
         // A pure live-web challenge: no files, the target is the challenge.
         body.source = 'none';
         body.value = '';
       }
       if (!allowedSources.includes(body.source)) {
-        throw httpError('bad_request', 'source must be "url" (git), "path" (local folder), or "download" (archive/file URL) — or omit it and pass a target');
+        throw httpError('bad_request', 'source must be "url" (git), "path" (local folder), "download" (archive URL), or "upload" (raw file body) — or omit it and pass a target');
       }
-      if (body.source !== 'none' && (typeof body.value !== 'string' || !body.value.trim())) {
+      if (body.source !== 'none' && body.source !== 'upload' && (typeof body.value !== 'string' || !body.value.trim())) {
         throw httpError('bad_request', 'value must be a non-empty string');
       }
       await fs.mkdir(challengesDir, { recursive: true });
       const ing = await ingestChallenge({
         source: body.source,
-        value: body.source === 'none' ? '' : body.value.trim(),
+        value: body.source === 'none' ? '' : body.source === 'upload' ? body.value : body.value.trim(),
         challengesDir,
         target: target ?? null,
         maxBytes: typeof body.maxBytes === 'number' && Number.isFinite(body.maxBytes) && body.maxBytes > 0
@@ -596,7 +648,7 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
       await writeJson(path.join(chDir, 'challenge.json'), {
         challengeId: ing.challengeId,
         sourceType: body.source,
-        sourceValue: body.source === 'none' ? '' : body.value.trim(),
+        sourceValue: body.source === 'upload' ? uploadInfo.filename : body.source === 'none' ? '' : body.value.trim(),
         title: typeof body.title === 'string' ? body.title.slice(0, 120) : null,
         hint: typeof body.hint === 'string' ? body.hint.slice(0, 500) : null,
         target: ing.target ?? null,
@@ -606,7 +658,8 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
         fileCount: ing.fileCount,
         topFiles: ing.topFiles
       });
-      const resBody = { challengeId: ing.challengeId, fileCount: ing.fileCount, topFiles: ing.topFiles };
+      const resBody = { challengeId: ing.challengeId, fileCount: ing.fileCount, topFiles: ing.topFiles,
+        ...(uploadInfo ? { uploadedBytes: uploadInfo.bytes, filename: uploadInfo.filename } : {}) };
       const resHeaders = { Location: `/api/v1/challenges/${ing.challengeId}` };
       if (idemKey) {
         idempotencyCache.set(idemKey, { status: 201, body: resBody, headers: resHeaders });

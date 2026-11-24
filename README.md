@@ -39,7 +39,7 @@ settings panel can do both without a restart.
 
 | Command | What it does |
 | --- | --- |
-| `run <repoUrl\|localPath> [--challenge-id ID] [--workers N] [--budget-usd X] [--profile P]` | Full swarm, headless; events stream to stdout as JSONL |
+| `run <repoUrl\|localPath> [--target URL] [--challenge-id ID] [--workers N] [--budget-usd X] [--profile P]` | Full swarm, headless; events stream to stdout as JSONL. `localPath` may be a folder, a `.zip`/`.tar.gz` archive (extracted), or any single file (stored as one artifact). Archive-suffix URLs are downloaded and extracted. `--target` carries a live service URL alongside |
 | `serve [--port N] [--profile P]` | Engine + HTTP API + dashboard on `127.0.0.1` |
 | `status` | Challenges + swarms + workers, from the on-disk event stores |
 | `steer <swarmId> <workerId> <text>` | Steer one worker (queued into its next step) |
@@ -62,7 +62,7 @@ run immediately or park as pending chips until you confirm them one by one.
 All routes are JSON, bound to `127.0.0.1` only, and (when `SHINGUN_TOKEN` is
 set in `.env`) require `Authorization: Bearer <token>`:
 
-- `POST /api/v1/challenges` — ingest a git repo URL, a local folder, a downloaded archive/file URL (`"source":"download"`), or nothing but a live `target` — a pure live-web challenge (the service URL rides the swarm into every prompt and `TARGET.md`)
+- `POST /api/v1/challenges` — ingest a git repo URL, a local folder or file, a downloaded archive/file URL (`"source":"download"`), or nothing but a live `target` — a pure live-web challenge (the service URL rides the swarm into every prompt and `TARGET.md`). Archives (`.zip`/`.tar.gz`) are extracted in place — a downloaded picoCTF zip becomes a file tree the recon personas can drill. The same route accepts a raw file upload: send the zip/tar.gz bytes as the body (any non-JSON content type), with `?filename=challenge.zip` (or an `x-shingun-filename` header) and optional `&title=&hint=&target=` query metadata; the response `201` echoes `uploadedBytes`. `"source":"upload"` is what the ingest event records.
 - `POST /api/challenges/:id/swarm` — launch a swarm
 - `GET /api/swarms/:id` — full swarm state, reconstructed by event replay
 - `POST /api/swarms/:id/stop`, `POST .../workers/:wid/message`, `GET .../workers/:wid/diff`, `GET .../bundle`
