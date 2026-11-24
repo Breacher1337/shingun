@@ -23,3 +23,6 @@ gradle-5.6.4-bin.zip
 
 # python virtualenvs
 .venv/
+
+# bench run artifacts (events, results, summary stay on disk, untracked)
+bench-out*/
