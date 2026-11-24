@@ -1,0 +1,17 @@
+{
+  "steps": [
+    {
+      "tool_calls": [
+        { "function": { "name": "create_challenge", "arguments": { "source": "path", "value": "test/fixtures/challenge-easy", "flagFormatRegex": "^shingun\\{.+\\}$" } } },
+        { "function": { "name": "create_swarm", "arguments": { "workers": 3 } } }
+      ],
+      "content": "Challenge registered and a 3-worker swarm launched on it.",
+      "usage": { "prompt_tokens": 700, "completion_tokens": 90 }
+    },
+    {
+      "tool_calls": [ { "function": { "name": "status_node", "arguments": {} } } ],
+      "content": "Node state read. Standing by for the next directive.",
+      "usage": { "prompt_tokens": 700, "completion_tokens": 60 }
+    }
+  ]
+}

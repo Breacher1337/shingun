@@ -3,6 +3,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ingestChallenge } from './ingest.mjs';
 import { buildBundle } from './bundle.mjs';
+import { createGuardLedger } from './ledger.mjs';
+import { preflightRoleProviders } from './providers/preflight.mjs';
 import { listTree, nowIso, writeJson } from './util.mjs';
 
 /**
@@ -73,6 +75,17 @@ export async function startServer({
   const challengesDir = path.join(workspaceDir, 'challenges');
   await fs.mkdir(challengesDir, { recursive: true });
 
+  // Cockpit guard ledger: proposed-but-unconfirmed actions live here, in
+  // memory only — a restart clears the queue, exactly like a human would
+  // forget an un-confirmed instruction. Terminal swarms retire their
+  // pending actions so a confirm never lands on a dead swarm.
+  const guardLedger = createGuardLedger({ config });
+  bus.subscribe((ev) => {
+    if (ev?.type === 'swarm.update' && ev?.swarm && ev?.data?.final) {
+      guardLedger.expireSwarm(ev.swarm);
+    }
+  });
+
   /** Upsert NAME=value in a .env-style file. False only when the write fails. */
   async function upsertEnvValue(file, name, value) {
     try {
@@ -130,39 +143,12 @@ export async function startServer({
 
   // -- launch preflight ----------------------------------------------------
 
-  /**
-   * Every role the engine calls must be backed by a configured provider,
-   * and OpenAI-compatible providers must have something that resembles an
-   * API key. A URL-shaped value is the classic "pasted the dashboard
-   * address into the key field" mistake — refuse it up front with a
-   * message that says exactly that, instead of letting the swarm die
-   * mid-triage inside a cryptic 401.
-   */
-  function preflightRoleProviders() {
-    for (const roleName of ['master', 'worker']) {
-      const provName = config.roles?.[roleName]?.provider;
-      const prov = config.providers?.[provName];
-      if (!prov || !provName) {
-        return { code: 'provider_role_unconfigured', message: `role "${roleName}" has no provider — configure it in settings` };
-      }
-      if (prov.type === 'openai-compat') {
-        const provNameForMsg = provName;
-        const key = env?.[prov.apiKeyEnv] ?? process.env[prov.apiKeyEnv];
-        if (typeof key === 'string' && /:\/\//.test(key)) {
-          return {
-            code: 'provider_key_invalid',
-            message: `provider "${provNameForMsg}" used by role "${roleName}" holds "${key.slice(0, 40)}…" — that is a web address, not an API key. Paste the model provider key in settings, or switch the role to the keyless mock provider.`
-          };
-        }
-        if (!key) {
-          return {
-            code: 'provider_key_missing',
-            message: `provider "${provNameForMsg}" used by role "${roleName}" has no API key — paste one in settings, or switch the role to the keyless mock provider.`
-          };
-        }
-      }
-    }
-    return null;
+  // One implementation lives in src/providers/preflight.mjs and is shared
+  // with the console create_swarm tool, so the launch route and the master
+  // agent refuse with the same message for the same broken config.
+
+  function preflightIssues() {
+    return preflightRoleProviders(config, env);
   }
 
   // -- filesystem helpers ------------------------------------------------
@@ -393,7 +379,11 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
     let flushing = false;
     let maxSeqReplayed = 0;
     const unsubscribe = bus.subscribe((ev) => {
+      // A scoped stream carries its swarm; an unscoped stream carries the
+      // console thread only (its ids are console-<seq>, so they never
+      // collide with a swarm's sequence).
       if (swarmId && ev.swarm !== swarmId) return;
+      if (!swarmId && ev.swarm != null) return;
       if (!flushing) pending.push(ev);
       else send(ev);
     });
@@ -405,6 +395,12 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
           if (eventSeq(ev) > maxSeqReplayed) maxSeqReplayed = eventSeq(ev);
           send(ev);
         }
+      }
+    } else {
+      // Console backlog: the persisted thread replays as stored bytes.
+      for (const ev of await orchestrator.getConsoleStore().replay()) {
+        if (eventSeq(ev) > maxSeqReplayed) maxSeqReplayed = eventSeq(ev);
+        send(ev);
       }
     }
     flushing = true;
@@ -545,7 +541,7 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
             }
           })
         : false;
-      return sendJson(res, 200, { ok: true, roles: config.roles, persisted, issues: preflightRoleProviders() });
+      return sendJson(res, 200, { ok: true, roles: config.roles, persisted, issues: preflightIssues() });
     }
 
     if (req.method === 'POST' && segments.length === 1 && segments[0] === 'challenges') {
@@ -598,7 +594,7 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
         }
         budgetUsd = Math.min(budgetUsd, config.budget.perSwarmUsd);
       }
-      const providerIssue = preflightRoleProviders();
+      const providerIssue = preflightIssues();
       if (providerIssue) throw httpError(providerIssue.code, providerIssue.message);
       const { swarmId } = await orchestrator.startSwarm({
         challenge: {
@@ -688,17 +684,81 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
       throw httpError('not_found', `no route for ${req.method} ${pathname}`);
     }
 
+    // -- cockpit: the prompt is the master panel --------------------------
+
+    // POST /api/master/message {swarm?, text, guard?}
+    // Absent swarm = console scope: the master plans over the whole
+    // workspace (create challenges, launch swarms, purge, remove) instead
+    // of steering one live swarm.
     if (req.method === 'POST' && segments.length === 2 && segments[0] === 'master' && segments[1] === 'message') {
       const body = await readJsonBody(req);
-      if (typeof body.swarm !== 'string' || !body.swarm) {
-        throw httpError('bad_request', 'swarm must identify the target swarm id');
-      }
       if (typeof body.text !== 'string' || !body.text.trim()) {
         throw httpError('bad_request', 'text must be a non-empty string');
       }
-      await orchestrator.directive(body.swarm, body.text);
+      if (body.swarmId !== undefined) {
+        throw httpError('bad_request', 'pass "swarm", not "swarmId"');
+      }
+      const mode = guardLedger.validateMode(body.guard);
+      const gate = (a) => guardLedger.gate({ ...a, mode });
+      const hasSwarm = typeof body.swarm === 'string' && body.swarm.length > 0;
+      if (hasSwarm) {
+        guardLedger.expireForDirective({ scope: 'sw', swarm: body.swarm });
+        await orchestrator.directive(body.swarm, body.text, { gate });
+      } else if (body.swarm === undefined || body.swarm === null || body.swarm === '') {
+        guardLedger.expireForDirective({ scope: 'console' });
+        await orchestrator.directiveConsole({ text: body.text, gate });
+      } else {
+        throw httpError('bad_request', 'swarm must be a swarm id string or absent for console scope');
+      }
       // The reply travels as master.chat events on /api/events, never here.
       return sendJson(res, 200, { ok: true });
+    }
+
+    // POST /api/master/confirm {actionId} — executes exactly one ledger
+    // entry. Superseded (a newer directive or a swarm transition retired
+    // it) answers 410; unknown ids answer 404. The executed action's
+    // result is appended to the console thread / swarm chat as a
+    // master.chat line, so the transcript stays the source of truth.
+    if (req.method === 'POST' && segments.length === 2 && segments[0] === 'master' && segments[1] === 'confirm') {
+      const body = await readJsonBody(req);
+      if (typeof body.actionId !== 'string' || !body.actionId.trim()) {
+        throw httpError('bad_request', 'actionId must be a non-empty string');
+      }
+      const { action, entry } = await guardLedger.confirm(body.actionId);
+      await orchestrator.recordExecuted({ entry, action });
+      return sendJson(res, 200, { executed: true, actionId: body.actionId });
+    }
+
+    // GET /api/node — node-scope read-back for the operator: console thread
+    // tail, the pending confirm ledger with actionIds, the current guard
+    // mode, and a compact summary of every known swarm. A read: it is never
+    // gated, in any guard mode.
+    if (req.method === 'GET' && segments.length === 1 && segments[0] === 'node') {
+      const consoleLines = await orchestrator.getConsoleStore().replay();
+      const swarms = [];
+      const challengeEntries = await fs.readdir(challengesDir, { withFileTypes: true }).catch(() => []);
+      for (const entry of challengeEntries) {
+        if (!entry.isDirectory()) continue;
+        const evDir = path.join(challengesDir, entry.name, 'events');
+        const files = await fs.readdir(evDir).catch(() => []);
+        for (const f of files.filter((x) => x.endsWith('.jsonl'))) {
+          const events = await replay(path.join(evDir, f));
+          if (!events.length) continue;
+          const lastUpdate = [...events].reverse().find((e) => e.type === 'swarm.update');
+          swarms.push({
+            id: f.replace(/\.jsonl$/, ''),
+            challenge: entry.name,
+            status: lastUpdate?.data?.status ?? 'planning',
+            flagsCount: events.filter((e) => e.type === 'flag.found').length
+          });
+        }
+      }
+      return sendJson(res, 200, {
+        guard: guardLedger.defaultMode,
+        pending: guardLedger.snapshot(),
+        consoleThread: consoleLines.slice(-40),
+        swarms
+      });
     }
 
     throw httpError('not_found', `no route for ${req.method} ${pathname}`);
@@ -713,12 +773,13 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
   const requestHandler = (req, res) => handle(req, res).catch((e) => {
     const code = e?.code ?? 'internal';
     if (!res.headersSent) {
-      const notFound = ['swarm_unknown', 'challenge_unknown', 'worker_unknown', 'not_found', 'bundle_empty'];
+      const notFound = ['swarm_unknown', 'challenge_unknown', 'worker_unknown', 'not_found', 'bundle_empty', 'action_unknown'];
       const badRequest = ['bad_json', 'bad_request', 'payload_too_large', 'provider_key_missing', 'provider_key_invalid', 'provider_role_unconfigured'];
       const status = notFound.includes(code) ? 404
         : badRequest.includes(code) ? 400
         : code === 'unauthorized' ? 401
         : code === 'bundle_not_terminal' ? 409
+        : code === 'action_superseded' ? 410
         : code === 'provider_http' ? 502
         : 500;
       res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });

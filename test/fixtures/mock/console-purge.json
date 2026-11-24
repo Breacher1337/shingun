@@ -1,0 +1,9 @@
+{
+  "steps": [
+    {
+      "tool_calls": [ { "function": { "name": "purge_swarm", "arguments": {} } } ],
+      "content": "Purge proposed: stop the swarm if live and clear its working artifacts, keeping every review artifact.",
+      "usage": { "prompt_tokens": 650, "completion_tokens": 70 }
+    }
+  ]
+}

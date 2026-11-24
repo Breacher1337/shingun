@@ -1,0 +1,9 @@
+{
+  "steps": [
+    {
+      "tool_calls": [ { "function": { "name": "status_node", "arguments": {} } } ],
+      "content": "Node status read. Nothing changed.",
+      "usage": { "prompt_tokens": 600, "completion_tokens": 50 }
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "steps": [
+    {
+      "tool_calls": [ { "function": { "name": "remove_challenge", "arguments": {} } } ],
+      "content": "Removal proposed: the whole challenge directory once its swarms are terminal.",
+      "usage": { "prompt_tokens": 650, "completion_tokens": 60 }
+    }
+  ]
+}

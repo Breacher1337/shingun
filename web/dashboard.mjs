@@ -65,7 +65,9 @@ const state = {
   caps: { perSwarmUsd: 0, workerMaxTokens: 0, workerMaxSteps: 0, workerWallClockMin: 0 },
   budget: { usd: 0, tokensIn: 0, tokensOut: 0 },
   flags: [],
-  chat: [],
+  chat: [],            // swarm-scope master thread (bound swarm)
+  consoleChat: [],     // console-scope master thread (persists across swarms)
+  guard: localStorage.getItem('shingun.guard') ?? 'majors',
   admission: null,
   workers: new Map(), // id → worker record
   inspector: null,   // open worker id
@@ -151,13 +153,22 @@ function renderDeckShell() {
     h('div', { class: 'deck-head' },
       h('span', { class: 'label' }, 'command deck'),
       h('span', { class: 'who' }, 'master'),
-      h('span', { class: 'chip', id: 'deck-status' }, h('i', { class: 'dot' }), h('span', null, 'idle')),
+      h('span', { class: 'chip', id: 'deck-status' }, h('i', { class: 'dot' }), h('span', null, 'console')),
       h('span', { class: 'grow', style: 'flex:1' }),
+      h('label', { class: 'guard-wrap' }, 'guard', h('select', {
+        id: 'deck-guard',
+        title: 'instant: everything runs · majors: creates/stops/purges wait for confirm · all: every mutation waits',
+        onchange: (e) => {
+          state.guard = e.target.value;
+          localStorage.setItem('shingun.guard', state.guard);
+        }
+      },
+        ...['instant', 'majors', 'all'].map((m) => h('option', { value: m, selected: m === state.guard }, m)))),
       h('span', { class: 'label', id: 'deck-swarm-label' }, '')
     ),
     h('div', { class: 'deck-log', id: 'deck-log' }),
     h('div', { class: 'deck-inputbar' },
-      h('input', { id: 'deck-input', placeholder: 'directive to the master…', spellcheck: 'false' }),
+      h('input', { id: 'deck-input', placeholder: 'ask the master…', spellcheck: 'false' }),
       h('button', { id: 'deck-send', onclick: sendDirective }, 'send')
     )
   );
@@ -294,15 +305,18 @@ function paintTopbar() {
   flagsEl.querySelector('.flagcount').textContent = String(state.flags.length);
   flagsEl.title = state.flags.map((f) => `${f.flag} (${f.formatMatch}) via ${f.workerId}`).join('\n');
 
+  // The deck is the console: it works with no swarm bound and survives a
+  // swarm going terminal — only a dead server disables it.
   const input = $('#deck-input');
   const send = $('#deck-send');
   const terminal = TERMINAL.includes(state.status) || state.final;
-  input.disabled = !state.swarmId || terminal;
-  send.disabled = input.disabled;
-  input.placeholder = terminal ? 'swarm is terminal — launch a new challenge'
-    : state.swarmId ? 'directive to the master…' : 'connect a swarm first…';
-  const deckStatus = $('#deck-status');
-  deckSpan(deckStatus, terminal ? 'terminal' : state.swarmId ? state.status : 'idle');
+  const swarmLive = Boolean(state.swarmId) && !terminal;
+  input.disabled = false;
+  send.disabled = false;
+  input.placeholder = swarmLive
+    ? `directive to ${state.swarmId}…`
+    : 'console: ask the master — “attack examples/sqli-lab with 4 workers”';
+  deckSpan($('#deck-status'), swarmLive ? state.status : 'console');
 }
 
 function deckSpan(chip, text) {
@@ -468,29 +482,62 @@ function paintWallMeters() {
 
 // ---- command deck ------------------------------------------------------------
 
+/** One action chip: executed (`ok`/`!ok`), or pending with a confirm button. */
+function actChip(a) {
+  if (a?.pending) {
+    const btn = h('button', { class: 'act-btn', onclick: () => confirmAction(a.actionId, btn) }, 'confirm');
+    const chip = h('span', { class: 'act wait' }, `${a.op} — awaiting confirm `, btn);
+    return chip;
+  }
+  const d = a.detail ?? {};
+  const desc = a.op === 'spawn_worker' ? `spawn ${d.persona ?? a.persona ?? d.workerId ?? '?'}`
+    : a.op === 'prune_worker' ? `prune ${d.workerId ?? a.workerId ?? '?'}`
+    : a.op === 'stop_swarm' ? 'stop swarm'
+    : a.op === 'status_report' ? 'status report'
+    : a.op === 'status_node' ? 'node status'
+    : a.op === 'create_challenge' ? `challenge ${d.challengeId ?? ''}`.trim()
+    : a.op === 'create_swarm' ? `swarm ${d.swarmId ?? ''}`.trim()
+    : a.op === 'purge_swarm' ? `purge ${d.swarmId ?? ''}`.trim()
+    : a.op === 'remove_challenge' ? `remove ${d.challengeId ?? ''}`.trim()
+    : `${a.op ?? 'action'}`;
+  const okOk = a.ok !== false;
+  const chip = h('span', { class: `act ${okOk ? 'ok' : 'bad'}` }, desc + (okOk ? '' : ' ✕'));
+  if (a.detail) chip.title = JSON.stringify(a.detail).slice(0, 300);
+  return chip;
+}
+
+async function confirmAction(actionId, btn) {
+  if (!actionId) return;
+  btn.disabled = true;
+  try {
+    await api('/api/master/confirm', { method: 'POST', body: { actionId } });
+    btn.replaceWith(document.createTextNode('✓ confirmed — executing'));
+  } catch (e) {
+    btn.disabled = false;
+    toast(`confirm failed: ${e.message}`, 'warn', 12000);
+  }
+}
+
 function deckMessage(entry) {
-  const who = entry.direction === 'user' ? 'you' : 'master';
+  const who = entry.direction === 'user' ? 'you' : entry.direction === 'note' ? '·' : 'master';
+  const head = h('div', { class: 'msg-head' },
+    h('span', { class: 'who' }, who),
+    entry.scope === 'console' ? h('span', { class: 'who scope' }, 'console') : null);
   const bubble = h('div', { class: `msg ${entry.direction}` },
-    h('div', { class: 'msg-head' }, h('span', { class: 'who' }, who)),
+    head,
     h('div', { class: 'bubble' }, entry.text ?? '')
   );
   if (entry.actions?.length) {
-    bubble.append(h('div', { class: 'acts' }, entry.actions.map((a) => {
-      const desc = a.op === 'spawn_worker' ? `spawn ${a.persona ?? '?'}`
-        : a.op === 'prune_worker' ? `prune ${a.workerId ?? '?'}`
-        : a.op === 'stop_swarm' ? 'stop swarm'
-        : a.op === 'status_report' ? 'status report'
-        : `${a.op ?? 'action'}`;
-      const okOk = a.ok !== false;
-      return h('span', { class: `act ${okOk ? 'ok' : 'bad'}` }, desc + (okOk ? '' : ' ✕'));
-    })));
+    bubble.append(h('div', { class: 'acts' }, entry.actions.map(actChip)));
   }
   return bubble;
 }
 
 function renderDeck() {
   const log = $('#deck-log');
-  log.replaceChildren(...state.chat.map(deckMessage));
+  const all = [...state.chat.map((e) => ({ ...e, scope: e.scope ?? 'sw' })), ...state.consoleChat]
+    .sort((a, b) => (a._n ?? 0) - (b._n ?? 0));
+  log.replaceChildren(...all.map(deckMessage));
   log.scrollTop = log.scrollHeight;
 }
 
@@ -510,7 +557,11 @@ function renderDeckStatus(text, ok = false) {
 async function sendDirective() {
   const input = $('#deck-input');
   const text = input.value.trim();
-  if (!text || !state.swarmId) return;
+  if (!text) return;
+  // Scope: a live bound swarm takes the directive; otherwise the message
+  // goes to the console master, which owns the whole node.
+  const terminal = TERMINAL.includes(state.status) || state.final;
+  const swarmLive = Boolean(state.swarmId) && !terminal;
   input.value = '';
   renderDeckStatus('master thinking…');
   let spin = null;
@@ -518,10 +569,12 @@ async function sendDirective() {
     spin = h('div', { class: 'msg note' }, '…');
     $('#deck-log').append(spin);
     $('#deck-log').scrollTop = $('#deck-log').scrollHeight;
-    const out = await api('/api/master/message', { method: 'POST', body: { swarm: state.swarmId, text } });
+    const body = { text, guard: state.guard };
+    if (swarmLive) body.swarm = state.swarmId;
+    const out = await api('/api/master/message', { method: 'POST', body });
     spin.remove();
     if (!out?.ok) throw new Error('master did not accept the directive');
-    renderDeckStatus('sent — watch the stream');
+    renderDeckStatus(swarmLive ? 'sent — watch the stream' : 'console — watch the thread');
   } catch (e) {
     spin?.remove?.();
     renderDeckStatus('error', false);
@@ -645,10 +698,23 @@ function openInspector(wid) {
 // ---- event application -----------------------------------------------------------
 
 let sseAbort = null;
+let consoleAbort = null;
 let lastSeqApplied = 0;
+let lastConsoleSeq = 0; // console-<seq> lives in its own namespace
+let deckArrival = 0;
 
 function applyEvent(ev) {
-  if (seqOf(ev.id) && seqOf(ev.id) <= lastSeqApplied) return; // backlog dedupe
+  // Console lines stream with swarm == null and id console-<n>; swarm
+  // events carry their own <swarmId>-<n> — dedupe the two namespaces
+  // separately so a console-stream reconnect never duplicates the thread
+  // and never drops early swarm events.
+  if (ev.swarm == null) {
+    const s = seqOf(ev.id);
+    if (s && s <= lastConsoleSeq) return;
+    if (s) lastConsoleSeq = s;
+  } else {
+    if (seqOf(ev.id) && seqOf(ev.id) <= lastSeqApplied) return; // backlog dedupe
+  }
   const wid = ev.worker;
   const w = wid ? workerRec(wid) : null;
   switch (ev.type) {
@@ -665,10 +731,18 @@ function applyEvent(ev) {
       renderHero();
       break;
     case 'master.chat': {
-      const entry = { direction: ev.data.direction, text: ev.data.text, actions: ev.data.actions };
-      state.chat.push(entry);
+      const scope = ev.data?.scope ?? (ev.swarm == null ? 'console' : 'sw');
+      const entry = {
+        direction: ev.data.direction,
+        text: ev.data.text,
+        actions: ev.data.actions ?? [],
+        scope,
+        _n: ++deckArrival
+      };
+      if (scope === 'console') state.consoleChat.push(entry);
+      else state.chat.push(entry);
       appendDeck(entry);
-      if (ev.data.direction === 'master') renderDeckStatus('master replied', true);
+      if (ev.data.direction === 'master') renderDeckStatus(`master replied${scope === 'console' ? ' · console' : ''}`, true);
       break;
     }
     case 'worker.spawn':
@@ -790,6 +864,26 @@ function applyEvent(ev) {
 
 // ---- SSE ------------------------------------------------------------------
 
+/** Shared SSE body reader: parses data: blocks and hands each event over. */
+async function consumeSse(res, onEvent) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let sep;
+    while ((sep = buf.indexOf('\n\n')) >= 0) {
+      const block = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      const dataLine = block.split('\n').find((l) => l.startsWith('data: '));
+      if (!dataLine) continue; // heartbeat/comment block
+      try { onEvent(JSON.parse(dataLine.slice(6))); } catch { /* skip a malformed block */ }
+    }
+  }
+}
+
 async function startSse(swarmId) {
   if (sseAbort) sseAbort.abort();
   sseAbort = new AbortController();
@@ -801,27 +895,38 @@ async function startSse(swarmId) {
         signal
       });
       if (!res.ok || !res.body) throw new Error(`events stream ${res.status}`);
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let sep;
-        while ((sep = buf.indexOf('\n\n')) >= 0) {
-          const block = buf.slice(0, sep);
-          buf = buf.slice(sep + 2);
-          const dataLine = block.split('\n').find((l) => l.startsWith('data: '));
-          if (!dataLine) continue; // heartbeat/comment block
-          try {
-            applyEvent(JSON.parse(dataLine.slice(6)));
-          } catch { /* skip a malformed block */ }
-        }
-      }
+      await consumeSse(res, applyEvent);
     } catch (e) {
       if (signal.aborted) return;
       renderDeckStatus('stream down — retrying');
+    }
+    if (signal.aborted) return;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+}
+
+/**
+ * Console stream: the unscoped /api/events lane replays the persisted
+ * console thread and then follows it live. It runs from boot and never
+ * aborts — the console survives swarm switches, restarts and terminals.
+ */
+async function startConsoleSse() {
+  if (consoleAbort) consoleAbort.abort();
+  consoleAbort = new AbortController();
+  const { signal } = consoleAbort;
+  for (;;) {
+    try {
+      const res = await fetch('/api/events', {
+        headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {},
+        signal
+      });
+      if (!res.ok || !res.body) throw new Error(`console stream ${res.status}`);
+      await consumeSse(res, applyEvent);
+    } catch (e) {
+      if (signal.aborted) return;
+      // The console stream must survive server restarts silently: the
+      // next successful connect replays the persisted thread (console-<n>
+      // ids dedupe what was already painted).
     }
     if (signal.aborted) return;
     await new Promise((r) => setTimeout(r, 2000));
@@ -843,7 +948,13 @@ async function loadSwarm(swarmId) {
     Object.assign(state.caps, snap.caps ?? {});
     state.budget = { ...snap.budget };
     state.flags = [...(snap.flags ?? [])];
-    state.chat = [...(snap.masterChat ?? [])].map((m) => ({ direction: m.direction, text: m.text, actions: m.actions }));
+    state.chat = [...(snap.masterChat ?? [])].map((m) => ({
+      direction: m.direction,
+      text: m.text,
+      actions: m.actions,
+      scope: m.scope ?? 'sw',
+      _n: ++deckArrival
+    }));
     state.admission = snap.admission ?? null;
     state.workers = new Map();
     state.inspector = null;
@@ -1128,6 +1239,7 @@ renderDeckShell();
 paintTopbar();
 paintTiles();
 renderHero();
+startConsoleSse(); // the console thread exists before any swarm does
 
 const last = localStorage.getItem('shingun.lastSwarm');
 if (last) {

@@ -106,58 +106,87 @@ export async function respawnVariant({ provider, deadStrategies, digestText }) {
 }
 
 /**
- * handleDirective: the chat surface's engine path. The master's tools are
+ * handleDirective: the cockpit's engine path. The master's tools are
  * orchestrator operations; every exchange emits master.chat events with the
- * actions that actually executed.
+ * actions that actually executed (or wait as pending confirm chips).
+ * Scope decides the catalog: a bound swarm keeps the original four; the
+ * console (no swarm bound) carries the full v2 catalog including node
+ * lifecycle.
  */
-export async function handleDirective({ provider, directive, ops, statusSnapshot }) {
+export const SWARM_DIRECTIVE_TOOLS = [
+  { type: 'function', function: { name: 'spawn_worker', description: 'Spawn one more worker in this swarm with a persona and an optional strategy hint.', parameters: { type: 'object', properties: { persona: { type: 'string' }, hint: { type: 'string' } }, required: ['persona'] } } },
+  { type: 'function', function: { name: 'prune_worker', description: 'Stop a running worker by id.', parameters: { type: 'object', properties: { workerId: { type: 'string' }, reason: { type: 'string' } }, required: ['workerId'] } } },
+  { type: 'function', function: { name: 'stop_swarm', description: 'Stop the swarm.', parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: [] } } },
+  { type: 'function', function: { name: 'status_report', description: 'Report the current swarm status summary.', parameters: { type: 'object', properties: {}, required: [] } } }
+];
+
+export const CONSOLE_DIRECTIVE_TOOLS = [
+  ...SWARM_DIRECTIVE_TOOLS.map((t) => ({ type: 'function', function: { ...t.function } })),
+  { type: 'function', function: { name: 'status_node', description: 'Read node-wide state: registered challenges and live swarms with their status and flag counts.', parameters: { type: 'object', properties: {}, required: [] } } },
+  { type: 'function', function: { name: 'create_challenge', description: 'Ingest a challenge from a local path or git url into the node workspace.', parameters: { type: 'object', properties: { source: { type: 'string', enum: ['path', 'url'] }, value: { type: 'string' }, flagFormatRegex: { type: 'string' }, categoryHint: { type: 'string' } }, required: ['source', 'value'] } } },
+  { type: 'function', function: { name: 'create_swarm', description: 'Launch a swarm against a registered challenge. Absent challengeId targets the newest challenge this session created.', parameters: { type: 'object', properties: { challengeId: { type: 'string' }, workers: { type: 'number' }, budgetUsd: { type: 'number' } }, required: [] } } },
+  { type: 'function', function: { name: 'purge_swarm', description: 'Stop the swarm if live and clear its working artifacts (worktrees, scratch, tools). Review artifacts — events, transcripts, diffs, postmortems, bundles — survive. Absent swarmId targets the newest live swarm.', parameters: { type: 'object', properties: { swarmId: { type: 'string' }, force: { type: 'boolean' } }, required: [] } } },
+  { type: 'function', function: { name: 'remove_challenge', description: 'Remove a challenge directory entirely. Absent challengeId targets the newest challenge this session created. Refused while any of its swarms is non-terminal.', parameters: { type: 'object', properties: { challengeId: { type: 'string' } }, required: [] } } }
+];
+// Console-scope ids are explicit: the original four gain their swarm argument.
+for (const tool of CONSOLE_DIRECTIVE_TOOLS) {
+  const f = tool.function;
+  if (['spawn_worker', 'prune_worker', 'stop_swarm', 'status_report'].includes(f.name)) {
+    const props = f.parameters.properties;
+    props.swarmId = { type: 'string' };
+    if (f.name !== 'status_report') {
+      f.parameters.required = ['swarmId', ...f.parameters.required.filter((r) => r !== 'swarmId')];
+    }
+  }
+}
+
+export async function handleDirective({
+  provider,
+  directive,
+  ops,
+  statusSnapshot,
+  tools = SWARM_DIRECTIVE_TOOLS,
+  thread = [],
+  preamble = 'You are the shingun master orchestrator. The operator typed a directive.',
+  meta = { fixture: 'directive', key: 'directive', role: 'master' }
+}) {
+  const act = `Act via tools: ${tools.map((t) => `${t.function.name}(${Object.keys(t.function.parameters?.properties ?? {}).join(', ')})`).join(', ')}. Answer briefly in content after acting.`;
+  const lines = [preamble];
+  if (thread.length) {
+    lines.push('', '## Console thread so far (continuity)', ...thread);
+  }
+  lines.push(`Current status: ${JSON.stringify(statusSnapshot)}`);
+  lines.push(`Directive: ${directive}`);
+  lines.push(act);
   const res = await provider.chat({
-    messages: [{
-      role: 'user',
-      content: [
-        'You are the shingun master orchestrator. The operator typed a directive.',
-        `Current swarm status: ${JSON.stringify(statusSnapshot)}`,
-        `Directive: ${directive}`,
-        'Act via tools: spawn_worker(persona, hint), prune_worker(workerId, reason), stop_swarm(reason), status_report(). Answer briefly in content after acting.'
-      ].join('\n')
-    }],
-    tools: [
-      { type: 'function', function: { name: 'spawn_worker', description: 'Spawn one more worker with a persona and an optional strategy hint.', parameters: { type: 'object', properties: { persona: { type: 'string' }, hint: { type: 'string' } }, required: ['persona'] } } },
-      { type: 'function', function: { name: 'prune_worker', description: 'Stop a running worker by id.', parameters: { type: 'object', properties: { workerId: { type: 'string' }, reason: { type: 'string' } }, required: ['workerId'] } } },
-      { type: 'function', function: { name: 'stop_swarm', description: 'Stop the entire swarm.', parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: [] } } },
-      { type: 'function', function: { name: 'status_report', description: 'Report the current swarm status summary.', parameters: { type: 'object', properties: {}, required: [] } } }
-    ],
-    meta: { fixture: 'directive', key: 'directive', role: 'master' }
+    messages: [{ role: 'user', content: lines.join('\n') }],
+    tools,
+    meta
   });
 
   const actions = [];
   for (const call of res.message.tool_calls ?? []) {
     let args = {};
     try { args = JSON.parse(call.function?.arguments ?? '{}'); } catch { /* empty */ }
-    switch (call.function?.name) {
-      case 'spawn_worker': {
-        const ok = await ops.spawnWorker(args.persona, args.hint);
-        actions.push({ op: 'spawn_worker', persona: args.persona, ok });
-        break;
-      }
-      case 'prune_worker': {
-        const ok = await ops.pruneWorker(args.workerId, args.reason ?? 'operator directive');
-        actions.push({ op: 'prune_worker', workerId: args.workerId, ok });
-        break;
-      }
-      case 'stop_swarm': {
-        await ops.stopSwarm(args.reason ?? 'operator directive');
-        actions.push({ op: 'stop_swarm', ok: true });
-        break;
-      }
-      case 'status_report': {
-        const s = await ops.statusReport();
-        actions.push({ op: 'status_report', summary: s });
-        break;
-      }
-      default:
-        actions.push({ op: call.function?.name ?? 'unknown', ok: false });
+    const op = call.function?.name;
+    if (!ops[op]) {
+      actions.push({ op, args, ok: false, detail: { code: 'unknown_tool' } });
+      continue;
     }
+    // gate: () => Promise<Action> when the caller guards directives
+    // (undefined at engine level for direct execution). A thrown refusal
+    // (swarms_active, bad_request, …) becomes a failed action the model
+    // reads and can answer for — never a crashed directive.
+    let out;
+    try {
+      out = ops[op].gate
+        ? await ops[op].gate(args)
+        : { op, ok: true, detail: await ops[op](args) };
+    } catch (e) {
+      out = { op, args, ok: false, detail: { code: e?.code ?? 'tool_failed', message: e?.message ?? String(e) } };
+    }
+    if (!out.op) out.op = op;
+    actions.push(out);
   }
   return { reply: res.message.content ?? '', actions };
 }

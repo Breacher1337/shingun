@@ -8,6 +8,14 @@ config.json
 # internal engineering docs — not part of the public product
 ARCHITECTURE.md
 QUESTIONS.md
+STYLE-GUIDE.md
+
+# research wing (internal thesis artifacts)
+research/
+
+# stray local binaries
+as363.exe
+gradle-5.6.4-bin.zip
 
 # misc
 *.tmp

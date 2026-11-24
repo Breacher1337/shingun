@@ -188,6 +188,19 @@ input, select, textarea { font: inherit; }
 .act { font-size: 10px; padding: 2px 8px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line-2); color: #b7c4d0; }
 .act.ok { border-color: #245a3c; color: #bdeccf; }
 .act.bad { border-color: #5a2c2c; color: #e6a0a0; }
+.act.wait { border-color: #6b4a26; color: #ffd9a0; display: inline-flex; align-items: center; gap: 6px; }
+.act-btn { font: inherit; font-size: 10px; padding: 1px 9px; border-radius: 999px; border: 1px solid #6b4a26;
+  background: #2b1f12; color: #ffd9a0; cursor: pointer; }
+.act-btn:hover { background: #3a2a18; }
+.act-btn:disabled { opacity: 0.5; cursor: wait; }
+
+/* guard mode select in the deck head: majors gates creates/stops/purges,
+   all gates every mutation, instant runs everything (purge still waits). */
+.guard-wrap { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--dim); }
+.guard-wrap select { background: var(--bg); border: 1px solid var(--line-2); border-radius: 6px;
+  color: var(--text); font-size: 11px; padding: 3px 6px; }
+.guard-wrap select:focus { outline: none; border-color: var(--accent); }
+.msg-head .who.scope { color: #ffd9a0; border: 1px solid #6b4a26; border-radius: 999px; padding: 0 7px; }
 
 .deck-inputbar { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); align-items: center; }
 .deck-inputbar input { flex: 1; background: var(--bg); border: 1px solid var(--line-2); border-radius: 7px;

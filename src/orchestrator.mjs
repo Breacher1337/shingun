@@ -9,11 +9,14 @@ import { createScrubber } from './scrub.mjs';
 import { getProvider } from './providers/registry.mjs';
 import { addWorktree, captureDiff } from './worktree.mjs';
 import { runWorker } from './worker.mjs';
-import { PERSONA_CATALOG, triage as masterTriage, buildDigest, respawnVariant, handleDirective, readRepoSummary } from './master.mjs';
+import { PERSONA_CATALOG, triage as masterTriage, buildDigest, respawnVariant, handleDirective, readRepoSummary, CONSOLE_DIRECTIVE_TOOLS } from './master.mjs';
+import { openConsoleStore } from './console.mjs';
+import { preflightRoleProviders } from './providers/preflight.mjs';
 import { readNotes, buildDigestInput, fallbackDigest } from './notes.mjs';
 import { renderPostmortem, writePostmortem } from './postmortem.mjs';
 import { envSecrets } from './config.mjs';
-import { newId, ensureDir } from './util.mjs';
+import { ingestChallenge } from './ingest.mjs';
+import { newId, ensureDir, writeJson, listTree } from './util.mjs';
 
 /**
  * Swarm lifecycle: spawn (admission-gated), stall monitoring, prune +
@@ -378,8 +381,10 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
     };
   }
 
-  /** Directive cockpit: the master manipulates the running swarm. */
-  async function directive(swarmId, text) {
+  /** Directive cockpit: the master manipulates the running swarm. Guarded
+   * executions arrive as a `gate` (server-side ledger); without one the ops
+   * execute directly — engine-level tests drive it this way. */
+  async function directive(swarmId, text, opts = {}) {
     const s = swarms.get(swarmId);
     if (!s) throw Object.assign(new Error(`unknown swarm ${swarmId}`), { code: 'swarm_unknown' });
     const emit = s.emit;
@@ -387,35 +392,289 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
       // Terminal swarms still answer: the exchange persists to the deck so a
       // relayed directive never vanishes from the operator's chat history.
       const reply = 'Swarm is already terminal.';
-      await emit('master.chat', { direction: 'user', text });
+      await emit('master.chat', { direction: 'user', text, scope: 'sw' });
       await emit('master.chat', { direction: 'master', text: reply, actions: [] });
       return { reply, actions: [] };
     }
-    await emit('master.chat', { direction: 'user', text });
+    await emit('master.chat', { direction: 'user', text, scope: 'sw' });
     const masterProvider = getProviderFor('master');
+    const rawOps = {
+      spawn_worker: async (args) => {
+        const persona = args.persona && PERSONA_CATALOG[args.persona] ? args.persona : 'hypothesis-prover';
+        const wid = newId('w');
+        s.workers.set(wid, syncStub(wid, 'directive'));
+        const notes = await readNotes(path.join(s.chDir, 'notes.jsonl')).catch(() => []);
+        spawnSwarmWorker(s, {
+          persona, strategyPrompt: args.hint ?? personaFallbackStrategy(persona),
+          digestText: fallbackDigest(notes, s.deadStrategies.map((d) => `${d.persona}: ${d.note}`)),
+          masterProvider, challengeFlag: s.challenge.flagFormat, workerIdHint: wid
+        }).then(() => maybeCloseSwarm(s, emit)).catch(() => {});
+        return { spawned: wid, persona };
+      },
+      prune_worker: async (args) => {
+        const ok = await pruneWorker(s, emit, args.workerId, args.reason ?? 'directive');
+        return ok === false ? { ok: false, detail: { workerId: args.workerId } } : true;
+      },
+      stop_swarm: async (args) => {
+        await stopSwarm(s, emit, args.reason ?? 'directive');
+        return true;
+      },
+      status_report: async () => statusSummary(swarmId)
+    };
+    const ops = {};
+    for (const [op, fn] of Object.entries(rawOps)) {
+      ops[op] = opts.gate
+        ? { gate: (args) => opts.gate({ op, args, scope: 'sw', swarm: swarmId, execute: () => fn(args) }) }
+        : fn;
+    }
     const out = await handleDirective({
       provider: masterProvider,
       directive: text,
       statusSnapshot: statusSummary(swarmId),
-      ops: {
-        spawnWorker: async (persona, hint) => {
-          if (!(persona && PERSONA_CATALOG[persona])) persona = 'hypothesis-prover';
-          const wid = newId('w');
-          s.workers.set(wid, syncStub(wid, 'directive'));
-          const notes = await readNotes(path.join(s.chDir, 'notes.jsonl')).catch(() => []);
-          spawnSwarmWorker(s, {
-            persona, strategyPrompt: hint ?? personaFallbackStrategy(persona),
-            digestText: fallbackDigest(notes, s.deadStrategies.map((d) => `${d.persona}: ${d.note}`)),
-            masterProvider, challengeFlag: s.challenge.flagFormat, workerIdHint: wid
-          }).then(() => maybeCloseSwarm(s, emit)).catch(() => {});
-          return true;
-        },
-        pruneWorker: async (pwid, reason) => pruneWorker(s, emit, pwid, reason ?? 'directive'),
-        stopSwarm: async (reason) => { await stopSwarm(s, emit, reason ?? 'directive'); return true; },
-        statusReport: async () => statusSummary(swarmId)
-      }
+      ops,
+      meta: opts.meta
     });
-    await emit('master.chat', { direction: 'master', text: out.reply, actions: out.actions });
+    await emit('master.chat', { direction: 'master', text: out.reply, scope: 'sw', actions: out.actions });
+    return out;
+  }
+
+  // -- console scope ------------------------------------------------------
+
+  let consoleStore = null;
+  const getConsoleStore = () => (consoleStore ?? (consoleStore = openConsoleStore({ dir: workspaceDir, bus: bus ?? null })));
+
+  const TERMINAL_SWARM_STATUSES = ['solved', 'stopped', 'capped'];
+  let lastChallengeId = null;
+  let lastSwarmId = null;
+
+  function engineError(code, message) {
+    return Object.assign(new Error(message), { code });
+  }
+
+  /** Challenge registration, shared with the console create_challenge tool. */
+  async function createChallenge({ source, value, flagFormatRegex, categoryHint } = {}) {
+    if (source !== 'url' && source !== 'path') {
+      throw engineError('bad_request', 'source must be "url" or "path"');
+    }
+    if (typeof value !== 'string' || !value.trim()) {
+      throw engineError('bad_request', 'value must be a non-empty string');
+    }
+    await ensureDir(challengesDir);
+    const ing = await ingestChallenge({ source, value: value.trim(), challengesDir });
+    const chDir = path.join(challengesDir, ing.challengeId);
+    await writeJson(path.join(chDir, 'challenge.json'), {
+      challengeId: ing.challengeId,
+      sourceType: source,
+      sourceValue: value.trim(),
+      flagFormatRegex: typeof flagFormatRegex === 'string' ? flagFormatRegex : null,
+      categoryHint: typeof categoryHint === 'string' ? categoryHint : null,
+      ingestedAt: new Date().toISOString(),
+      fileCount: ing.fileCount,
+      topFiles: ing.topFiles
+    });
+    lastChallengeId = ing.challengeId;
+    return { challengeId: ing.challengeId, fileCount: ing.fileCount, topFiles: ing.topFiles };
+  }
+
+  /** Launch a swarm on a registered challenge (console create_swarm). */
+  async function createSwarm({ challengeId, workers, budgetUsd } = {}) {
+    const providerIssue = preflightRoleProviders(config, env);
+    if (providerIssue) throw engineError(providerIssue.code, providerIssue.message);
+    const cid = challengeId ?? lastChallengeId;
+    if (!cid) {
+      throw engineError('bad_request', 'create_swarm: no challenge registered in this session yet — call create_challenge first or pass challengeId');
+    }
+    const chDir = path.join(challengesDir, cid);
+    const meta = await fs.readFile(path.join(chDir, 'challenge.json'), 'utf8')
+      .then((t) => JSON.parse(t))
+      .catch(() => null);
+    if (!meta) throw engineError('challenge_unknown', `challenge not registered under this node: ${cid}`);
+    let workerCount;
+    if (workers !== undefined) {
+      workerCount = Number(workers);
+      if (!Number.isInteger(workerCount) || workerCount < 1) {
+        throw engineError('bad_request', 'workers must be a positive integer');
+      }
+      workerCount = Math.min(workerCount, config.concurrency.perChallengeWorkers);
+    }
+    let budget;
+    if (budgetUsd !== undefined) {
+      budget = Number(budgetUsd);
+      if (!Number.isFinite(budget) || budget <= 0) {
+        throw engineError('bad_request', 'budgetUsd must be a positive number');
+      }
+      budget = Math.min(budget, config.budget.perSwarmUsd);
+    }
+    const { fileCount, topFiles } = await listTree(path.join(chDir, 'base')).catch(() => ({ fileCount: 0, topFiles: [] }));
+    const { swarmId } = await startSwarm({
+      challenge: {
+        id: cid,
+        sourceType: meta.sourceType,
+        sourceValue: meta.sourceValue,
+        baseDir: path.join(chDir, 'base'),
+        fileCount,
+        topFiles,
+        flagFormatRegex: meta.flagFormatRegex,
+        categoryHint: meta.categoryHint
+      },
+      opts: { workers: workerCount, budgetUsd: budget }
+    });
+    lastSwarmId = swarmId;
+    return { swarmId };
+  }
+
+  /** Console purge: stop if live, clear working artifacts, KEEP review
+   * artifacts. */
+  async function purgeSwarm({ swarmId } = {}) {
+    const sid = swarmId ?? lastSwarmId;
+    if (!sid) throw engineError('bad_request', 'purge_swarm: no swarm this session to target — pass swarmId');
+    const s = swarms.get(sid);
+    if (s && !TERMINAL_SWARM_STATUSES.includes(s.status)) {
+      await stopSwarm(s, s.emit, 'purged (operator confirm)');
+      for (let i = 0; i < 200; i++) {
+        const settled = [...s.workers.values()].every((w) => w.closed || w.isReservation);
+        if (settled) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    }
+    const chDir = s ? s.chDir : await locateChallengeForSwarm(sid);
+    if (!chDir) throw engineError('swarm_unknown', `unknown swarm ${sid}`);
+    for (const dirName of ['worktrees', 'scratch', 'tools']) {
+      await fs.rm(path.join(chDir, dirName), { recursive: true, force: true }).catch(() => {});
+    }
+    return { swarmId: sid, kept: ['events', 'transcripts', 'diffs', 'postmortems', 'bundles'] };
+  }
+
+  async function locateChallengeForSwarm(swarmId) {
+    if (!/^[\w-]+$/.test(swarmId ?? '')) return null;
+    const entries = await fs.readdir(challengesDir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const storeFile = path.join(challengesDir, entry.name, 'events', `${swarmId}.jsonl`);
+      const exists = await fs.stat(storeFile).then(() => true).catch(() => false);
+      if (exists) return path.join(challengesDir, entry.name);
+    }
+    return null;
+  }
+
+  /** Console remove: whole directory, refused while any swarm is non-terminal. */
+  async function removeChallenge({ challengeId } = {}) {
+    const cid = challengeId ?? lastChallengeId;
+    if (!cid) {
+      throw engineError('bad_request', 'remove_challenge: no challenge registered in this session yet — pass challengeId or call create_challenge first');
+    }
+    const chDir = path.join(challengesDir, cid);
+    const exists = await fs.stat(chDir).then(() => true).catch(() => false);
+    if (!exists) throw engineError('challenge_unknown', `challenge not registered under this node: ${cid}`);
+    for (const [sid, s] of swarms) {
+      if (s.challengeId === cid && !TERMINAL_SWARM_STATUSES.includes(s.status)) {
+        throw engineError('swarms_active', `challenge ${cid} still has a live swarm (${sid}) — purge or stop it first`);
+      }
+    }
+    const eventFiles = await fs.readdir(path.join(chDir, 'events')).catch(() => []);
+    for (const f of eventFiles.filter((x) => x.endsWith('.jsonl'))) {
+      const store = await openEventStore(path.join(chDir, 'events', f), { swarmId: f.replace(/\.jsonl$/, '') });
+      const events = await store.replay();
+      const lastUpdate = [...events].reverse().find((e) => e.type === 'swarm.update');
+      const terminal = lastUpdate?.data?.final ?? TERMINAL_SWARM_STATUSES.includes(lastUpdate?.data?.status ?? '');
+      if (events.length && !terminal) {
+        throw engineError('swarms_active', `challenge ${cid} has swarm ${f.replace(/\.jsonl$/, '')} that never reached terminal state`);
+      }
+    }
+    await fs.rm(chDir, { recursive: true, force: true }).catch(() => {});
+    if (lastChallengeId === cid) lastChallengeId = null;
+    return { challengeId: cid, removed: true };
+  }
+
+  /** Node-wide read for the console master: challenges on disk + live swarms. */
+  async function statusNode() {
+    const dirs = await fs.readdir(challengesDir, { withFileTypes: true }).catch(() => []);
+    const challengeIds = dirs.filter((d) => d.isDirectory()).map((d) => d.name);
+    const liveSwarms = [...swarms.values()].map((s) => ({
+      swarmId: s.id, challengeId: s.challengeId, status: s.status, flags: s.flags.length
+    }));
+    return { challenges: { count: challengeIds.length, ids: challengeIds }, liveSwarms, newestChallenge: lastChallengeId, newestSwarm: lastSwarmId };
+  }
+
+  /** Route a console master-chat line (also used by confirm receipts, #28). */
+  async function appendConsoleChat(data) {
+    return getConsoleStore().appendChat(data);
+  }
+
+  /** Record a guard-confirmed execution into its thread. */
+  async function recordExecuted({ entry, action }) {
+    const executed = {
+      op: action.op,
+      ok: action.ok,
+      ...(action.detail !== null && action.detail !== undefined ? { detail: action.detail } : {})
+    };
+    const text = `confirmed: ${entry.op}`;
+    if (entry.scope === 'console') {
+      return getConsoleStore().appendChat({ direction: 'master', text, scope: 'console', actions: [executed] });
+    }
+    const s = swarms.get(entry.swarm);
+    if (s) return s.emit('master.chat', { direction: 'master', text, scope: 'sw', actions: [executed] });
+    return null;
+  }
+
+  /** Console-scope directive: thread continuity from the store. */
+  async function directiveConsole({ text, gate, meta }) {
+    const store = getConsoleStore();
+    const thread = await store.seed(30);
+    await store.appendChat({ direction: 'user', text, scope: 'console' });
+    const masterProvider = getProviderFor('master', { logSink: store.logSink });
+    const rawOps = {
+      status_node: async () => ({ ...(await statusNode()) }),
+      create_challenge: async (args) => createChallenge(args),
+      create_swarm: async (args) => {
+        const out = await createSwarm(args);
+        return { swarmId: out.swarmId, challengeId: args.challengeId ?? lastChallengeId };
+      },
+      purge_swarm: async (args) => purgeSwarm(args),
+      remove_challenge: async (args) => removeChallenge(args),
+      spawn_worker: async (args) => {
+        const s = swarms.get(args.swarmId);
+        if (!s) throw engineError('swarm_unknown', `unknown swarm ${args.swarmId}`);
+        const sub = await directive(args.swarmId, text, { gate, meta });
+        return sub.actions[0] ?? { ok: false, detail: { code: 'delegate' } };
+      },
+      prune_worker: async (args) => {
+        const s = swarms.get(args.swarmId);
+        if (!s) throw engineError('swarm_unknown', `unknown swarm ${args.swarmId}`);
+        const ok = await pruneWorker(s, s.emit, args.workerId, args.reason ?? 'console directive');
+        return ok === false ? { ok: false, detail: { workerId: args.workerId } } : true;
+      },
+      stop_swarm: async (args) => {
+        const sid = args.swarmId ?? lastSwarmId;
+        const s = swarms.get(sid);
+        if (!s) throw engineError('swarm_unknown', `unknown swarm ${sid}`);
+        await stopSwarm(s, s.emit, args.reason ?? 'console directive');
+        return true;
+      },
+      status_report: async (args) => {
+        const sid = args.swarmId ?? lastSwarmId;
+        const s = swarms.get(sid);
+        if (!s) throw engineError('swarm_unknown', `unknown swarm ${sid}`);
+        return statusSummary(sid);
+      }
+    };
+    const ops = {};
+    for (const [op, fn] of Object.entries(rawOps)) {
+      ops[op] = gate
+        ? { gate: (args) => gate({ op, args, scope: 'console', swarm: args?.swarmId ?? null, execute: () => fn(args) }) }
+        : fn;
+    }
+    const out = await handleDirective({
+      provider: masterProvider,
+      directive: text,
+      statusSnapshot: await statusNode(),
+      tools: CONSOLE_DIRECTIVE_TOOLS,
+      thread,
+      preamble: 'You are the shingun master orchestrator on console duty — no single swarm is bound; the operator drives the whole node from this console. Prefer explicit ids when known.',
+      ops,
+      meta: meta ?? { fixture: 'console-directive', key: 'console', role: 'master' }
+    });
+    await store.appendChat({ direction: 'master', text: out.reply, scope: 'console', actions: out.actions });
     return out;
   }
 
@@ -556,7 +815,9 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
   }
 
   return {
-    startSwarm, resume, stop, steerWorker, directive, statusSummary,
+    startSwarm, resume, stop, steerWorker, directive, directiveConsole,
+    createChallenge, createSwarm, purgeSwarm, removeChallenge, statusNode,
+    appendConsoleChat, recordExecuted, getConsoleStore, statusSummary,
     activeWorkerCount, guard, swarms,
     emitAll: () => [...swarms.keys()]
   };

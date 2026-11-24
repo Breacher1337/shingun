@@ -96,7 +96,12 @@ test('acceptance 4a: dashboard page boots, launches the sqli-lab swarm, records 
     assert.equal(typeof document.querySelector('#tb-flags').onclick, 'function');
     const deckInput = document.querySelector('#deck-input');
     assert.ok(deckInput, 'command deck renders');
-    assert.equal(deckInput.disabled, true, 'deck waits for a swarm');
+    // Cockpit v2: the deck is the console — it lives before any swarm.
+    assert.equal(deckInput.disabled, false, 'deck answers with no swarm bound (console scope)');
+    assert.ok(document.querySelector('#deck-guard'), 'guard mode selector renders');
+    assert.equal(['instant', 'majors', 'all'].every((m) =>
+      [...document.querySelectorAll('#deck-guard option')].some((o) => o.value === m)), true,
+      'guard selector offers instant / majors / all');
 
     // -- launch modal: prefill, category, cloud count ----------------------
     tbNew.onclick();
