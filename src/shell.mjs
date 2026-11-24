@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 
 /**
  * Cross-platform command execution: timeout, output caps, tree kill.
@@ -17,15 +18,25 @@ function resolveShell() {
     resolvedShell = { cmd: '/bin/sh', args: ['-c'] };
     return resolvedShell;
   }
-  const onPath = (process.env.PATH ?? '').split(';').some((p) => {
-    if (!p) return false;
+  const gitBashCandidates = [
+    'C:\\Program Files\\Git\\bin\\bash.exe',
+    'C:\\Program Files (x86)\\Git\\bin\\bash.exe',
+  ];
+  for (const candidate of gitBashCandidates) {
+    if (fs.existsSync(candidate)) {
+      resolvedShell = { cmd: candidate, args: ['-c'] };
+      return resolvedShell;
+    }
+  }
+  const onPath = (process.env.PATH ?? '').split(';').map((p) => p.trim()).find((dir) => {
+    if (!dir || /WindowsApps/i.test(dir)) return false;
     try {
-      const dir = p.trim();
       return fs.existsSync(`${dir}\\bash.exe`) || fs.existsSync(`${dir}/bash.exe`);
     } catch { return false; }
   });
   if (onPath) {
-    resolvedShell = { cmd: 'bash.exe', args: ['-c'] };
+    const full = fs.existsSync(`${onPath}\\bash.exe`) ? `${onPath}\\bash.exe` : `${onPath}/bash.exe`;
+    resolvedShell = { cmd: full, args: ['-c'] };
   } else {
     resolvedShell = { cmd: process.env.ComSpec ?? 'cmd.exe', args: ['/d', '/c'] };
   }
@@ -54,6 +65,13 @@ function runProcess(cmd, args, { cwd, timeoutSec, outputCap, detached }) {
   delete env.FORCE_COLOR;
   delete env.CLICOLOR_FORCE;
   env.NO_COLOR = '1';
+  const nodeDir = path.dirname(process.execPath);
+  if (nodeDir) {
+    const currentPaths = (env.PATH ?? '').split(path.delimiter);
+    if (!currentPaths.includes(nodeDir)) {
+      env.PATH = `${nodeDir}${path.delimiter}${env.PATH ?? ''}`;
+    }
+  }
   return new Promise((resolve) => {
     const started = Date.now();
     const child = spawn(cmd, args, {

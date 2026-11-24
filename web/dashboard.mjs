@@ -465,7 +465,7 @@ function tickClocks() {
   const anyLive = [...state.workers.values()].some((w) => !w.gone);
   if (anyLive) paintWallMeters();
 }
-setInterval(tickClocks, 1000);
+setInterval(tickClocks, 1000)?.unref?.();
 
 function paintWallMeters() {
   const cap = state.caps.workerWallClockMin * 60;
@@ -884,6 +884,17 @@ async function consumeSse(res, onEvent) {
   }
 }
 
+/**
+ * A retry cadence that never pins a Node process open: the underlying
+ * timer is unref'd when the runtime supports it, so a drained event loop
+ * (tests and CLI one-shots) exits instead of waiting for the next retry.
+ * Browsers have no unref and keep the live-reconnect behavior unchanged.
+ */
+const sleepRetry = (ms) => new Promise((r) => {
+  const timer = setTimeout(r, ms);
+  timer.unref?.();
+});
+
 async function startSse(swarmId) {
   if (sseAbort) sseAbort.abort();
   sseAbort = new AbortController();
@@ -901,36 +912,57 @@ async function startSse(swarmId) {
       renderDeckStatus('stream down — retrying');
     }
     if (signal.aborted) return;
-    await new Promise((r) => setTimeout(r, 2000));
+    await sleepRetry(2000);
   }
 }
 
 /**
  * Console stream: the unscoped /api/events lane replays the persisted
- * console thread and then follows it live. It runs from boot and never
- * aborts — the console survives swarm switches, restarts and terminals.
+ * console thread and then follows it live. Runs from boot — the console
+ * outlives every swarm — and survives server restarts by probing: on
+ * stream loss the console goes offline and retries every few seconds
+ * until a fresh connect replays the thread (console-<n> ids dedupe the
+ * repaint). Probes use a plain interval; in non-browser runtimes a
+ * drained loop can tear it down without waiting for the next probe.
  */
+let consoleProbe = null;
+
+function startConsoleProbe(signal) {
+  if (consoleProbe) return;
+  consoleProbe = setInterval(() => {
+    if (signal.aborted) { stopConsoleProbe(); return; }
+    consoleStreamOnce(signal);
+  }, 3000);
+  consoleProbe.unref?.();
+}
+
+function stopConsoleProbe() {
+  if (consoleProbe) { clearInterval(consoleProbe); consoleProbe = null; }
+}
+
+async function consoleStreamOnce(signal) {
+  try {
+    const res = await fetch('/api/events', {
+      headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {},
+      signal
+    });
+    if (!res.ok || !res.body) throw new Error(`console stream ${res.status}`);
+    stopConsoleProbe();
+    deckSpan($('#deck-status'), state.swarmId && !TERMINAL.includes(state.status) ? state.status : 'console');
+    await consumeSse(res, applyEvent);
+  } catch (e) {
+    if (signal.aborted) { stopConsoleProbe(); return; }
+  }
+  // Reaching here means the stream ended or failed while never aborted:
+  // show it and let the probe bring the console back when it can.
+  deckSpan($('#deck-status'), 'console offline');
+  startConsoleProbe(signal);
+}
+
 async function startConsoleSse() {
   if (consoleAbort) consoleAbort.abort();
   consoleAbort = new AbortController();
-  const { signal } = consoleAbort;
-  for (;;) {
-    try {
-      const res = await fetch('/api/events', {
-        headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {},
-        signal
-      });
-      if (!res.ok || !res.body) throw new Error(`console stream ${res.status}`);
-      await consumeSse(res, applyEvent);
-    } catch (e) {
-      if (signal.aborted) return;
-      // The console stream must survive server restarts silently: the
-      // next successful connect replays the persisted thread (console-<n>
-      // ids dedupe what was already painted).
-    }
-    if (signal.aborted) return;
-    await new Promise((r) => setTimeout(r, 2000));
-  }
+  await consoleStreamOnce(consoleAbort.signal);
 }
 
 // ---- bootstrap -------------------------------------------------------------
