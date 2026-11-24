@@ -567,19 +567,39 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
         return sendJson(res, cached.status, cached.body, cached.headers);
       }
       const body = await readJsonBody(req);
-      if (body.source !== 'url' && body.source !== 'path') {
-        throw httpError('bad_request', 'source must be "url" or "path"');
+      const target = body.target === undefined || body.target === null ? null : body.target;
+      if (target !== null && (typeof target !== 'object' || !/^https?:\/\/.+/i.test(String(target.url ?? '').trim()))) {
+        throw httpError('bad_request', 'target must be {url, note?} with an http(s) url — the live service the challenge runs at');
       }
-      if (typeof body.value !== 'string' || !body.value.trim()) {
+      const allowedSources = ['url', 'path', 'download', 'none'];
+      if (target && body.source === undefined) {
+        // A pure live-web challenge: no files, the target is the challenge.
+        body.source = 'none';
+        body.value = '';
+      }
+      if (!allowedSources.includes(body.source)) {
+        throw httpError('bad_request', 'source must be "url" (git), "path" (local folder), or "download" (archive/file URL) — or omit it and pass a target');
+      }
+      if (body.source !== 'none' && (typeof body.value !== 'string' || !body.value.trim())) {
         throw httpError('bad_request', 'value must be a non-empty string');
       }
       await fs.mkdir(challengesDir, { recursive: true });
-      const ing = await ingestChallenge({ source: body.source, value: body.value.trim(), challengesDir });
+      const ing = await ingestChallenge({
+        source: body.source,
+        value: body.source === 'none' ? '' : body.value.trim(),
+        challengesDir,
+        target: target ?? null,
+        maxBytes: typeof body.maxBytes === 'number' && Number.isFinite(body.maxBytes) && body.maxBytes > 0
+          ? Math.min(body.maxBytes, 1024 * 1024 * 1024) : undefined
+      });
       const chDir = path.join(challengesDir, ing.challengeId);
       await writeJson(path.join(chDir, 'challenge.json'), {
         challengeId: ing.challengeId,
         sourceType: body.source,
-        sourceValue: body.value.trim(),
+        sourceValue: body.source === 'none' ? '' : body.value.trim(),
+        title: typeof body.title === 'string' ? body.title.slice(0, 120) : null,
+        hint: typeof body.hint === 'string' ? body.hint.slice(0, 500) : null,
+        target: ing.target ?? null,
         flagFormatRegex: typeof body.flagFormatRegex === 'string' ? body.flagFormatRegex : null,
         categoryHint: typeof body.categoryHint === 'string' ? body.categoryHint : null,
         ingestedAt: nowIso(),
@@ -645,6 +665,9 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
           baseDir: path.join(chDir, 'base'),
           fileCount,
           topFiles,
+          title: meta.title ?? null,
+          hint: meta.hint ?? null,
+          target: meta.target ?? null,
           flagFormatRegex: meta.flagFormatRegex,
           categoryHint: meta.categoryHint
         },

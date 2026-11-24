@@ -8,7 +8,7 @@ import { TOOL_SCHEMAS, executeTool } from './workertools.mjs';
  * capped, finished, or pruned. Everything streams out through `emit`;
  * transcripts persist per line under the challenge workspace.
  */
-export function workerSystemPrompt({ persona, strategyPrompt, digestText, flagFormat, notesPath, toolsDir, config }) {
+export function workerSystemPrompt({ persona, strategyPrompt, digestText, flagFormat, notesPath, toolsDir, config, target }) {
   return [
     `You are a shingun swarm worker assigned persona "${persona}".`,
     '',
@@ -17,6 +17,11 @@ export function workerSystemPrompt({ persona, strategyPrompt, digestText, flagFo
     '',
     '## Inherited context from earlier sibling workers (dead ends included — do not repeat them)',
     digestText || 'None yet — you are the first wave.',
+    '',
+    '## Live target',
+    target
+      ? `A running service is part of this challenge: ${target.url}${target.note ? ` — ${target.note}` : ''}.\nIt is reachable over the network — attack it over HTTP. See TARGET.md in your checkout.`
+      : 'None — this challenge lives entirely in the files.',
     '',
     '## Ground rules',
     `- Work stays inside your checkout; arbitrary file reads outside it are refused.`,
@@ -40,6 +45,7 @@ export async function runWorker({
   strategyPrompt,
   digestText,
   flagFormat,
+  target = null,
   dirs, // { worktree, scratch, tools, notes, transcript }
   provider,
   lane = null, // model lane name when this worker rides roles.lanes.<name>
@@ -56,7 +62,7 @@ export async function runWorker({
 
   const messages = [{
     role: 'user',
-    content: workerSystemPrompt({ persona, strategyPrompt, digestText, flagFormat, notesPath: dirs.notes, toolsDir: dirs.tools, config })
+    content: workerSystemPrompt({ persona, strategyPrompt, digestText, flagFormat, notesPath: dirs.notes, toolsDir: dirs.tools, config, target })
   }];
 
   await fs.mkdir(path.dirname(dirs.transcript), { recursive: true });

@@ -62,7 +62,7 @@ run immediately or park as pending chips until you confirm them one by one.
 All routes are JSON, bound to `127.0.0.1` only, and (when `SHINGUN_TOKEN` is
 set in `.env`) require `Authorization: Bearer <token>`:
 
-- `POST /api/challenges` — ingest a repo URL or local folder
+- `POST /api/v1/challenges` — ingest a git repo URL, a local folder, a downloaded archive/file URL (`"source":"download"`), or nothing but a live `target` — a pure live-web challenge (the service URL rides the swarm into every prompt and `TARGET.md`)
 - `POST /api/challenges/:id/swarm` — launch a swarm
 - `GET /api/swarms/:id` — full swarm state, reconstructed by event replay
 - `POST /api/swarms/:id/stop`, `POST .../workers/:wid/message`, `GET .../workers/:wid/diff`, `GET .../bundle`

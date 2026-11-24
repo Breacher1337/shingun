@@ -42,7 +42,7 @@ function parseJsonLoose(text) {
 }
 
 /** Master triage: classify the challenge, infer the flag format, plan personas. */
-export async function triage({ provider, repoSummary, knownFlagFormat, categoryHint }) {
+export async function triage({ provider, repoSummary, knownFlagFormat, categoryHint, target }) {
   const prompt = [
     'You are the shingun master orchestrator triaging a CTF challenge repo.',
     '',
@@ -51,6 +51,7 @@ export async function triage({ provider, repoSummary, knownFlagFormat, categoryH
     '',
     'README excerpt:',
     (repoSummary.readmeExcerpt ?? '(no README)'),
+    target ? `Live target (running service, part of the challenge): ${target.url}${target.note ? ` — ${target.note}` : ''}` : '',
     categoryHint ? `Operator category hint: ${categoryHint}` : '',
     knownFlagFormat ? `Declared flag format regex: ${knownFlagFormat}` : '',
     '',

@@ -102,7 +102,7 @@ function usage(code = 1) {
     `shingun (進軍) — swarm CTF attacks on localhost
 
 Usage:
-  shingun run <repoUrl|localPath> [--challenge-id ID] [--workers N] [--budget-usd X] [--flag-format REGEX] [--category C] [--profile P] [--config FILE] [--workspace DIR]
+  shingun run <repoUrl|localPath|archiveUrl> [--target URL] [--challenge-id ID] [--workers N] [--budget-usd X] [--flag-format REGEX] [--category C] [--profile P] [--config FILE] [--workspace DIR]
   shingun serve [--port N] [--profile P] [--config FILE] [--workspace DIR]
   shingun status [--workspace DIR]
   shingun init-config
@@ -137,8 +137,18 @@ async function main() {
       break;
     }
     case 'run': {
-      const target = args._[0];
-      if (!target) usage(1);
+      const sourceArg = args._[0];
+      if (!sourceArg) usage(1);
+      // The live-service pointer (--target URL): optional on any source, and
+      // the whole challenge when no files are given at all.
+      let liveTarget = null;
+      if (typeof args.target === 'string' && args.target) {
+        if (!/^https?:\/\/.+/i.test(args.target)) {
+          throw new Error('--target must be an http(s) URL — the live service the challenge runs at');
+        }
+        liveTarget = { url: args.target };
+      }
+      if (!sourceArg && !liveTarget) usage(1);
       // CLI stdout is the JSONL event stream — nothing else may print.
       // If the consumer goes away (EPIPE), stop streaming but let the swarm
       // finish and write its workspace artifacts.
@@ -152,11 +162,13 @@ async function main() {
       process.stdout.on('error', (e) => {
         if (e.code === 'EPIPE') streamDown = true;
       });
-      const isUrl = /^https?:\/\//.test(target);
+      const isUrl = /^https?:\/\//.test(sourceArg);
+      const isArchiveUrl = isUrl && /\.(tar\.gz|tgz)$/i.test(String(sourceArg).split(/[?#]/)[0]);
       const challengesDir = path.join(workspaceDir, 'challenges');
       await mkdir(challengesDir, { recursive: true });
       const ing = await ingestChallenge({
-        source: isUrl ? 'url' : 'path', value: target, challengesDir,
+        source: !sourceArg ? 'none' : isArchiveUrl ? 'download' : isUrl ? 'url' : 'path',
+        value: sourceArg, challengesDir, target: liveTarget,
         challengeId: typeof args.challengeId === 'string' ? args.challengeId : undefined
       });
       // Operator-known challenge metadata: declared values bypass master
@@ -170,9 +182,11 @@ async function main() {
       const categoryHint = typeof args.category === 'string' && args.category ? args.category : null;
       const { swarmId } = await orch.startSwarm({
         challenge: {
-          id: ing.challengeId, sourceType: isUrl ? 'url' : 'path', sourceValue: target,
+          id: ing.challengeId,
+          sourceType: ing.target && !sourceArg ? 'none' : isArchiveUrl ? 'download' : isUrl ? 'url' : 'path',
+          sourceValue: sourceArg,
           baseDir: ing.baseDir, fileCount: ing.fileCount, topFiles: ing.topFiles,
-          flagFormatRegex, categoryHint
+          target: ing.target ?? null, flagFormatRegex, categoryHint
         },
         opts: {
           workers: typeof args.workers === 'string' ? Number(args.workers) : undefined,

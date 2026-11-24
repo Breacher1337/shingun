@@ -108,14 +108,16 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
     const masterProvider = getProviderFor('master', { logSink: path.join(chDir, 'transcripts', 'master.outbound.jsonl') });
     await emit('challenge.ingested', {
       sourceType: challenge.sourceType, sourceValue: challenge.sourceValue,
-      fileCount: challenge.fileCount, topFiles: challenge.topFiles, category: challenge.categoryHint
+      fileCount: challenge.fileCount, topFiles: challenge.topFiles, category: challenge.categoryHint,
+      ...(challenge.target ? { target: challenge.target } : {})
     });
     const summary = await readRepoSummary(challenge.baseDir);
     const plan = await masterTriage({
       provider: masterProvider,
       repoSummary: summary,
       knownFlagFormat: challenge.flagFormatRegex,
-      categoryHint: challenge.categoryHint
+      categoryHint: challenge.categoryHint,
+      target: challenge.target ?? null
     });
     await emit('master.triage', {
       category: plan.category,
@@ -136,7 +138,8 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
       const persona = plan.personas[i % plan.personas.length];
       spawnPromises.push(spawnSwarmWorker(s, {
         persona, strategyPrompt: PERSONA_CATALOG[persona].strategy,
-        digestText: fallbackDigest([], []), masterProvider, challengeFlag
+        digestText: fallbackDigest([], []), masterProvider, challengeFlag,
+        challengeTarget: s.challenge.target ?? null
       }).catch((e) => emit('worker.status', { status: 'finished', reason: `spawn_error: ${e.message}` }, { worker: 'unknown' })));
     }
     Promise.allSettled(spawnPromises).then(() => maybeCloseSwarm(s, emit));
@@ -148,7 +151,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
     return { swarmId, emit };
   }
 
-  async function spawnSwarmWorker(s, { persona, strategyPrompt, digestText, masterProvider, challengeFlag, workerIdHint }) {
+  async function spawnSwarmWorker(s, { persona, strategyPrompt, digestText, masterProvider, challengeFlag, challengeTarget = null, workerIdHint }) {
     const wid = workerIdHint ?? newId('w');
     const dirs = {
       worktree: path.join(s.chDir, 'worktrees', wid),
@@ -190,7 +193,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
     const result = await runWorker({
       workerId: wid, swarmId: s.id, challengeId: s.challengeId,
       challengeSlug: sourceSlug(s.challenge.sourceValue),
-      persona, strategyPrompt, digestText, flagFormat: challengeFlag,
+      persona, strategyPrompt, digestText, flagFormat: challengeFlag, target: challengeTarget,
       dirs,
       lane: workerLane.lane,
       provider: getProviderFor(workerLane.role, { logSink: path.join(s.chDir, 'transcripts', `${wid}.outbound.jsonl`) }),
@@ -319,7 +322,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
         fallbackText: fallbackDigest(notes, dead)
       }).catch(() => fallbackDigest(notes, dead));
       const rep = await respawnVariant({ provider: masterProvider, deadStrategies: s.deadStrategies.map((d) => d.persona), digestText }).catch(() => ({ persona: 'hypothesis-prover', strategyPrompt: PERSONA_CATALOG['hypothesis-prover'].strategy }));
-      const spawn = (spawnOpts) => spawnSwarmWorker(s, { ...spawnOpts, digestText, challengeFlag: s.challenge.flagFormat })
+      const spawn = (spawnOpts) => spawnSwarmWorker(s, { ...spawnOpts, digestText, challengeFlag: s.challenge.flagFormat, challengeTarget: s.challenge.target ?? null })
         .then((r) => { maybeCloseSwarm(s, emit); return r; });
       spawn({ persona: rep.persona, strategyPrompt: rep.strategyPrompt, workerIdHint: wid2, masterProvider }).catch(() => {});
       const variantBase = PERSONA_CATALOG[personaKey] ?? PERSONA_CATALOG['static-analyst'];
@@ -356,7 +359,8 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
       },
       challenge: {
         id: s.challengeId, sourceType: s.challenge.sourceType, sourceValue: s.challenge.sourceValue,
-        category: s.challenge.category, flagFormat: s.challenge.flagFormat, flagFormatSource: s.challenge.flagFormatSource
+        category: s.challenge.category, flagFormat: s.challenge.flagFormat, flagFormatSource: s.challenge.flagFormatSource,
+        target: s.challenge.target?.url ?? null
       },
       events,
       workers: [...s.workers.values()].map((w) => ({ ...w })),
@@ -422,7 +426,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
         spawnSwarmWorker(s, {
           persona, strategyPrompt: args.hint ?? personaFallbackStrategy(persona),
           digestText: fallbackDigest(notes, s.deadStrategies.map((d) => `${d.persona}: ${d.note}`)),
-          masterProvider, challengeFlag: s.challenge.flagFormat, workerIdHint: wid
+          masterProvider, challengeFlag: s.challenge.flagFormat, challengeTarget: s.challenge.target ?? null, workerIdHint: wid
         }).then(() => maybeCloseSwarm(s, emit)).catch(() => {});
         return { spawned: wid, persona };
       },
@@ -467,20 +471,33 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
   }
 
   /** Challenge registration, shared with the console create_challenge tool. */
-  async function createChallenge({ source, value, flagFormatRegex, categoryHint } = {}) {
-    if (source !== 'url' && source !== 'path') {
-      throw engineError('bad_request', 'source must be "url" or "path"');
+  async function createChallenge({ source, value, flagFormatRegex, categoryHint, target } = {}) {
+    const safeTarget = target && typeof target === 'object' && /^https?:\/\/.+/i.test(String(target.url ?? '').trim())
+      ? { url: String(target.url).trim(), note: target.note ? String(target.note).slice(0, 500) : undefined }
+      : null;
+    if (target && !safeTarget) {
+      throw engineError('bad_request', 'target must be {url, note?} with an http(s) url');
     }
-    if (typeof value !== 'string' || !value.trim()) {
+    if (!source && safeTarget) {
+      source = 'none'; // pure live-web challenge: the target is the challenge
+    }
+    if (source !== 'url' && source !== 'path' && source !== 'download' && source !== 'none') {
+      throw engineError('bad_request', 'source must be "url" (git), "path" (folder), or "download" (archive/file URL) — or pass a target for a pure live-web challenge');
+    }
+    if (source !== 'none' && (typeof value !== 'string' || !value.trim())) {
       throw engineError('bad_request', 'value must be a non-empty string');
     }
     await ensureDir(challengesDir);
-    const ing = await ingestChallenge({ source, value: value.trim(), challengesDir });
+    const ing = await ingestChallenge({
+      source, value: source === 'none' ? '' : value.trim(),
+      challengesDir, target: safeTarget
+    });
     const chDir = path.join(challengesDir, ing.challengeId);
     await writeJson(path.join(chDir, 'challenge.json'), {
       challengeId: ing.challengeId,
       sourceType: source,
-      sourceValue: value.trim(),
+      sourceValue: source === 'none' ? '' : value.trim(),
+      target: ing.target ?? null,
       flagFormatRegex: typeof flagFormatRegex === 'string' ? flagFormatRegex : null,
       categoryHint: typeof categoryHint === 'string' ? categoryHint : null,
       ingestedAt: new Date().toISOString(),
@@ -488,7 +505,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
       topFiles: ing.topFiles
     });
     lastChallengeId = ing.challengeId;
-    return { challengeId: ing.challengeId, fileCount: ing.fileCount, topFiles: ing.topFiles };
+    return { challengeId: ing.challengeId, fileCount: ing.fileCount, topFiles: ing.topFiles, target: ing.target ?? null };
   }
 
   /** Launch a swarm on a registered challenge (console create_swarm). */
@@ -529,6 +546,9 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
         baseDir: path.join(chDir, 'base'),
         fileCount,
         topFiles,
+        title: meta.title ?? null,
+        hint: meta.hint ?? null,
+        target: meta.target ?? null,
         flagFormatRegex: meta.flagFormatRegex,
         categoryHint: meta.categoryHint
       },
@@ -762,6 +782,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
           sourceType: sourceMatch?.sourceType ?? 'path',
           sourceValue: sourceMatch?.sourceValue ?? '(resumed)',
           baseDir: path.join(chDir, 'base'),
+          title: null, hint: null, target: sourceMatch?.target ?? null,
           category: triageEv?.category,
           flagFormat: triageEv?.flagFormat?.regex ?? null,
           flagFormatSource: triageEv?.flagFormat?.source ?? 'unknown'
@@ -811,7 +832,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
             spawnSwarmWorker(s, {
               persona,
               strategyPrompt: PERSONA_CATALOG[persona].strategy,
-              digestText, masterProvider, challengeFlag: challenge.flagFormat, workerIdHint: wid
+              digestText, masterProvider, challengeFlag: challenge.flagFormat, challengeTarget: challenge.target ?? null, workerIdHint: wid
             }).then(() => maybeCloseSwarm(s, emit)).catch(() => {});
           }
           s.stallTimer = setInterval(() => stallCheck(s, emit), Math.max(5, config.stall.checkIntervalSec) * 1000);
