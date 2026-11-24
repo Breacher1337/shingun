@@ -20,7 +20,9 @@ export function workerSystemPrompt({ persona, strategyPrompt, digestText, flagFo
     '',
     '## Live target',
     target
-      ? `A running service is part of this challenge: ${target.url}${target.note ? ` — ${target.note}` : ''}.\nIt is reachable over the network — attack it over HTTP. See TARGET.md in your checkout.`
+      ? `A running service is part of this challenge: ${target.url}${target.note ? ` — ${target.note}` : ''}.\n${/^tcp:\/\//i.test(target.url)
+        ? 'It is a RAW TCP service, not HTTP. Speak to it with small client scripts via run_shell — Node one-liners using net.connect work on this machine; it may stay completely silent until a well-formed line arrives, so probe systematically. See TARGET.md in your checkout.'
+        : 'It is reachable over the network — attack it over HTTP. See TARGET.md in your checkout.'}`
       : 'None — this challenge lives entirely in the files.',
     '',
     '## Ground rules',

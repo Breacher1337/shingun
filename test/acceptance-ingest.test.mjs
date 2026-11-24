@@ -173,7 +173,26 @@ test('ingest: a target rides any source, and a pure live-web challenge stands al
     assert.ok(targetMarkdown(target).includes(target.url));
     await assert.rejects(
       () => ingestChallenge({ source: 'none', challengesDir: dir, target: { url: 'ftp://nope' } }),
-      (e) => /target\.url must be an http/i.test(e.message)
+      (e) => /target\.url must be http\(s\)/i.test(e.message)
+    );
+
+    // nc-class challenges: tcp://host:port targets are first-class; the
+    // worker prompt switches from HTTP advice to raw-TCP client advice.
+    const tcpTarget = { url: 'tcp://xebec.example.net:10071', note: 'two printers, one private' };
+    const ingTcp = await ingestChallenge({ source: 'none', challengesDir: dir, target: tcpTarget });
+    const mdTcp = await fs.readFile(path.join(ingTcp.baseDir, 'TARGET.md'), 'utf8');
+    assert.match(mdTcp, /tcp:\/\/xebec\.example\.net:10071/);
+    assert.match(mdTcp, /two printers, one private/);
+    const promptTcp = workerSystemPrompt({
+      persona: 'web-recon', strategyPrompt: 's', digestText: null, flagFormat: null,
+      notesPath: '/n', toolsDir: '/t',
+      config: { worker: { commandTimeoutSec: 60 } }, target: tcpTarget
+    });
+    assert.match(promptTcp, /RAW TCP/);
+    assert.doesNotMatch(promptTcp, /attack it over HTTP/);
+    await assert.rejects(
+      () => ingestChallenge({ source: 'none', challengesDir: dir, target: { url: 'tcp://no-port.example.net' } }),
+      (e) => /tcp:\/\/<host>:<port>/i.test(e.message)
     );
   } finally {
     fs.rm(dir, { recursive: true, force: true }).catch(() => {});

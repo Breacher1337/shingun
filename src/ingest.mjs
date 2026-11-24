@@ -50,8 +50,10 @@ function validateTarget(target) {
   if (target === null || target === undefined) return null;
   if (typeof target !== 'object') throw httpError('bad_request', 'target must be {url, note?}');
   const url = String(target.url ?? '').trim();
-  if (!/^https?:\/\/.+/i.test(url)) {
-    throw httpError('bad_request', 'target.url must be an http(s) URL — the live service the challenge runs at');
+  const isHttp = /^https?:\/\/.+/i.test(url);
+  const isTcp = /^tcp:\/\/[A-Za-z0-9._\-]+:\d{1,5}(\/.*)?$/i.test(url);
+  if (!isHttp && !isTcp) {
+    throw httpError('bad_request', 'target.url must be http(s)://<host> or tcp://<host>:<port> — the live service the challenge runs at');
   }
   const note = target.note === undefined || target.note === null ? null : String(target.note).slice(0, 500);
   return { url, note };

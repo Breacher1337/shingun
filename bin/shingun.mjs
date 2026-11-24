@@ -102,7 +102,7 @@ function usage(code = 1) {
     `shingun (進軍) — swarm CTF attacks on localhost
 
 Usage:
-  shingun run <repoUrl|localPath|archiveUrl> [--target URL] [--challenge-id ID] [--workers N] [--budget-usd X] [--flag-format REGEX] [--category C] [--profile P] [--config FILE] [--workspace DIR]
+  shingun run <repoUrl|localPath|archiveUrl> [--target URL] [--target-note NOTE] [--challenge-id ID] [--workers N] [--budget-usd X] [--flag-format REGEX] [--category C] [--profile P] [--config FILE] [--workspace DIR]
   shingun serve [--port N] [--profile P] [--config FILE] [--workspace DIR]
   shingun status [--workspace DIR]
   shingun init-config
@@ -138,15 +138,19 @@ async function main() {
     }
     case 'run': {
       const sourceArg = args._[0];
-      if (!sourceArg) usage(1);
       // The live-service pointer (--target URL): optional on any source, and
       // the whole challenge when no files are given at all.
       let liveTarget = null;
       if (typeof args.target === 'string' && args.target) {
-        if (!/^https?:\/\/.+/i.test(args.target)) {
-          throw new Error('--target must be an http(s) URL — the live service the challenge runs at');
+        const isHttp = /^https?:\/\/.+/i.test(args.target);
+        const isTcp = /^tcp:\/\/[A-Za-z0-9._\-]+:\d{1,5}(\/.*)?$/i.test(args.target);
+        if (!isHttp && !isTcp) {
+          throw new Error('--target must be http(s)://<host> or tcp://<host>:<port> — the live service the challenge runs at');
         }
         liveTarget = { url: args.target };
+        if (typeof args.targetNote === 'string' && args.targetNote) {
+          liveTarget.note = args.targetNote.slice(0, 500);
+        }
       }
       if (!sourceArg && !liveTarget) usage(1);
       // CLI stdout is the JSONL event stream — nothing else may print.
