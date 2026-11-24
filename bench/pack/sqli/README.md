@@ -1,26 +1,14 @@
-# Web challenge: Legacy Login (sqli)
+# Web challenge:Legacy Login (sqli)
 
-A full neighborhood store application is running locally at:
+A live web application is running locally at:
 
-    http://127.0.0.1:8000/
+    http://127.0.0.1:8000/c/sqli/
 
-It is a real product — catalog, member accounts, cart, checkout, a
-private members' wall, a staff inventory panel. Nearly everything is
-built to current standards: the storefront search is parameterized and
-injection-tame.
+Attack it over HTTP (curl, scripts). Only this application is in scope:
+the host itself, the CTF platform around it, and any other challenge are
+out of scope.
 
-The exception is the legacy staff login, which still ships the v2.3-debug
-quick-fix: its SQL is string-concatenated. The staff panel predates the
-password-hashing policy, so the comparison runs against the stored
-literal.
-
-    http://127.0.0.1:8000/staff
-
-The flag lives only in the staff table (a recovery-motto row); no page
-ever displays it from a file.
-
-Only this application is in scope: the host itself and everything else
-around the web app are out of scope.
+Flag format: flag{...}
 
 ## Verify before you submit
 
