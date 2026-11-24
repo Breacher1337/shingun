@@ -1,0 +1,37 @@
+{
+  "name": "smoke",
+  "baseConfigFile": "config.json",
+  "concurrency": 1,
+  "_note": "Smoke manifest: mock provider (deterministic, no API spend) against the bundled sqli-lab example. Start the lab app first: cd examples/sqli-lab && node app.mjs &  — then: node bin/bench.mjs bench.example.json. Variants A/B behave identically under mock; swap configPatch to mistral + real challenge paths for the pilot benchmark. Code-level variants (no-personas, no-digest) need a shingun config knob first — sketch scope note in bin/bench.mjs.",
+  "variants": [
+    {
+      "name": "A-personas",
+      "workers": 3,
+      "budgetUsd": 0.25,
+      "timeoutMs": 600000,
+      "configPatch": {
+        "roles": { "master": { "provider": "mock" }, "worker": { "provider": "mock" } },
+        "worker": { "maxSteps": 12, "wallClockMin": 6 }
+      }
+    },
+    {
+      "name": "B-variant",
+      "workers": 3,
+      "budgetUsd": 0.25,
+      "timeoutMs": 600000,
+      "configPatch": {
+        "roles": { "master": { "provider": "mock" }, "worker": { "provider": "mock" } },
+        "worker": { "maxSteps": 12, "wallClockMin": 6 }
+      }
+    }
+  ],
+  "challenges": [
+    {
+      "id": "sqli-lab",
+      "path": "examples/sqli-lab",
+      "category": "misc",
+      "flagFormat": "shingun\\{[^}]*\\}",
+      "expect": "shingun{un10n_s3l3ct_pwn3d_th3_sh0p}"
+    }
+  ]
+}

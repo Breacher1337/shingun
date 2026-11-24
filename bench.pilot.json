@@ -1,0 +1,44 @@
+{
+  "name": "pilot",
+  "baseConfigFile": "config.json",
+  "concurrency": 1,
+  "_note": "Phase 1 (BENCHMARK.md §6). Real provider — do not run until MISTRAL_API_KEY is exported and the ctf-platform is up. Budgets: $0.75/challenge, phase total under ~$1 raw cost before caps. A-swarm = identity config; B-solo = single-loop agent (no respawn). Add the remaining five slugs for Phase 2 by copying entries under bench/pack/.",
+  "variants": [
+    {
+      "name": "A-swarm",
+      "workers": 4,
+      "budgetUsd": 0.75,
+      "timeoutMs": 1200000,
+      "configPatch": {
+        "roles": { "master": { "provider": "mistral" }, "worker": { "provider": "mistral" } },
+        "worker": { "maxSteps": 20, "wallClockMin": 12, "maxRespawnsPerChallenge": 4 }
+      }
+    },
+    {
+      "name": "B-solo",
+      "workers": 1,
+      "budgetUsd": 0.75,
+      "timeoutMs": 1200000,
+      "configPatch": {
+        "roles": { "master": { "provider": "mistral" }, "worker": { "provider": "mistral" } },
+        "worker": { "maxSteps": 40, "wallClockMin": 12, "maxRespawnsPerChallenge": 0 }
+      }
+    }
+  ],
+  "challenges": [
+    {
+      "id": "sqli",
+      "path": "bench/pack/sqli",
+      "category": "web",
+      "flagFormat": "flag\\{[^}]*\\}",
+      "expect": "flag{sql1_1nj3ct10n_ftw}"
+    },
+    {
+      "id": "idor",
+      "path": "bench/pack/idor",
+      "category": "web",
+      "flagFormat": "flag\\{[^}]*\\}",
+      "expect": "flag{1d0r_1s_st1ll_al1v3}"
+    }
+  ]
+}
