@@ -80,6 +80,8 @@ export async function startServer({
   // forget an un-confirmed instruction. Terminal swarms retire their
   // pending actions so a confirm never lands on a dead swarm.
   const guardLedger = createGuardLedger({ config });
+  const idempotencyCache = new Map();
+  const executedActions = new Map();
   bus.subscribe((ev) => {
     if (ev?.type === 'swarm.update' && ev?.swarm && ev?.data?.final) {
       guardLedger.expireSwarm(ev.swarm);
@@ -447,7 +449,8 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
       return;
     }
 
-    if (req.method === 'GET' && pathname === '/api/events') {
+    if (pathname === '/api/events' || pathname === '/api/v1/events') {
+      if (req.method !== 'GET') throw httpError('not_found', `no route for ${req.method} ${pathname}`);
       return handleEvents(req, res, url.searchParams.get('swarm') ?? null);
     }
 
@@ -455,11 +458,17 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
       throw httpError('not_found', `no route for ${req.method} ${pathname}`);
     }
 
-    const segments = pathname.slice('/api/'.length).split('/').map(decodeURIComponent);
+    let subpath = pathname.slice('/api/'.length);
+    if (subpath.startsWith('v1/')) {
+      subpath = subpath.slice('v1/'.length);
+    } else if (subpath === 'v1') {
+      subpath = '';
+    }
+    const segments = subpath ? subpath.split('/').map(decodeURIComponent) : [];
 
-    // Operator key provisioning: scan providers for missing keys; a POST
+    // Operator key provisioning: scan providers for missing keys; a POST/PUT
     // supplies one without a restart. Key values never appear in responses.
-    if (req.method === 'GET' && pathname === '/api/providers') {
+    if (req.method === 'GET' && segments.length === 1 && segments[0] === 'providers') {
       const providers = {};
       for (const [name, prov] of Object.entries(config.providers ?? {})) {
         providers[name] = {
@@ -476,9 +485,11 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
       return sendJson(res, 200, { providers, roles: config.roles ?? {} });
     }
 
-    if (req.method === 'POST' && segments.length === 1 && segments[0] === 'provider-key') {
+    const isProviderKeyPut = (req.method === 'PUT' || req.method === 'POST') && segments.length === 3 && segments[0] === 'providers' && segments[2] === 'key';
+    const isLegacyProviderKeyPost = req.method === 'POST' && segments.length === 1 && segments[0] === 'provider-key';
+    if (isProviderKeyPut || isLegacyProviderKeyPost) {
       const body = await readJsonBody(req);
-      const name = typeof body.provider === 'string' ? body.provider : '';
+      const name = isProviderKeyPut ? segments[1] : (typeof body.provider === 'string' ? body.provider : '');
       const prov = config.providers?.[name];
       if (!prov) throw httpError('bad_request', `unknown provider "${name}"`);
       if (prov.type !== 'openai-compat' || !prov.apiKeyEnv) {
@@ -517,7 +528,7 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
 
     // Role switching: point master/worker at any configured provider,
     // including the keyless mock — the escape hatch when no key is around.
-    if (req.method === 'POST' && segments.length === 1 && segments[0] === 'roles') {
+    if ((req.method === 'PUT' || req.method === 'POST') && segments.length === 1 && segments[0] === 'roles') {
       const body = await readJsonBody(req);
       const wanted = {};
       if (typeof body.both === 'string') { wanted.master = body.both; wanted.worker = body.both; }
@@ -545,6 +556,11 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
     }
 
     if (req.method === 'POST' && segments.length === 1 && segments[0] === 'challenges') {
+      const idemKey = req.headers['idempotency-key'];
+      if (idemKey && idempotencyCache.has(idemKey)) {
+        const cached = idempotencyCache.get(idemKey);
+        return sendJson(res, cached.status, cached.body, cached.headers);
+      }
       const body = await readJsonBody(req);
       if (body.source !== 'url' && body.source !== 'path') {
         throw httpError('bad_request', 'source must be "url" or "path"');
@@ -565,10 +581,30 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
         fileCount: ing.fileCount,
         topFiles: ing.topFiles
       });
-      return sendJson(res, 200, { challengeId: ing.challengeId, fileCount: ing.fileCount, topFiles: ing.topFiles });
+      const resBody = { challengeId: ing.challengeId, fileCount: ing.fileCount, topFiles: ing.topFiles };
+      const resHeaders = { Location: `/api/v1/challenges/${ing.challengeId}` };
+      if (idemKey) {
+        idempotencyCache.set(idemKey, { status: 201, body: resBody, headers: resHeaders });
+      }
+      return sendJson(res, 201, resBody, resHeaders);
     }
 
-    if (req.method === 'POST' && segments.length === 3 && segments[0] === 'challenges' && segments[2] === 'swarm') {
+    if (req.method === 'GET' && segments.length === 2 && segments[0] === 'challenges') {
+      const challengeId = segments[1];
+      const metaFile = path.join(challengesDir, challengeId, 'challenge.json');
+      const meta = await fs.readFile(metaFile, 'utf8')
+        .then((t) => JSON.parse(t))
+        .catch(() => null);
+      if (!meta) throw httpError('challenge_unknown', `unknown challenge ${challengeId}`);
+      return sendJson(res, 200, meta);
+    }
+
+    if (req.method === 'POST' && segments.length === 3 && segments[0] === 'challenges' && (segments[2] === 'swarms' || segments[2] === 'swarm')) {
+      const idemKey = req.headers['idempotency-key'];
+      if (idemKey && idempotencyCache.has(idemKey)) {
+        const cached = idempotencyCache.get(idemKey);
+        return sendJson(res, cached.status, cached.body, cached.headers);
+      }
       const challengeId = segments[1];
       const body = await readJsonBody(req);
       const chDir = path.join(challengesDir, challengeId);
@@ -609,7 +645,12 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
         },
         opts: { workers, budgetUsd }
       });
-      return sendJson(res, 200, { swarmId });
+      const resBody = { swarmId };
+      const resHeaders = { Location: `/api/v1/swarms/${swarmId}` };
+      if (idemKey) {
+        idempotencyCache.set(idemKey, { status: 201, body: resBody, headers: resHeaders });
+      }
+      return sendJson(res, 201, resBody, resHeaders);
     }
 
     if (segments[0] === 'swarms') {
@@ -623,7 +664,9 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
         return sendJson(res, 200, state);
       }
 
-      if (req.method === 'POST' && segments.length === 3 && segments[2] === 'stop') {
+      const isDeleteStop = req.method === 'DELETE' && segments.length === 2;
+      const isPostStop = req.method === 'POST' && segments.length === 3 && segments[2] === 'stop';
+      if (isDeleteStop || isPostStop) {
         const live = orchestrator.swarms.get(swarmId);
         if (!live) {
           const rec = await locateSwarm(swarmId);
@@ -656,7 +699,7 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
         return;
       }
 
-      if (req.method === 'POST' && segments.length === 5 && segments[2] === 'workers' && segments[4] === 'message') {
+      if (req.method === 'POST' && segments.length === 5 && segments[2] === 'workers' && (segments[4] === 'messages' || segments[4] === 'message')) {
         const body = await readJsonBody(req);
         if (typeof body.text !== 'string' || !body.text.trim()) {
           throw httpError('bad_request', 'text must be a non-empty string');
@@ -686,11 +729,11 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
 
     // -- cockpit: the prompt is the master panel --------------------------
 
-    // POST /api/master/message {swarm?, text, guard?}
+    // POST /api/v1/master/messages (and legacy POST /api/master/message) {swarm?, text, guard?}
     // Absent swarm = console scope: the master plans over the whole
     // workspace (create challenges, launch swarms, purge, remove) instead
     // of steering one live swarm.
-    if (req.method === 'POST' && segments.length === 2 && segments[0] === 'master' && segments[1] === 'message') {
+    if (req.method === 'POST' && segments.length === 2 && segments[0] === 'master' && (segments[1] === 'messages' || segments[1] === 'message')) {
       const body = await readJsonBody(req);
       if (typeof body.text !== 'string' || !body.text.trim()) {
         throw httpError('bad_request', 'text must be a non-empty string');
@@ -714,22 +757,33 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
       return sendJson(res, 200, { ok: true });
     }
 
-    // POST /api/master/confirm {actionId} — executes exactly one ledger
-    // entry. Superseded (a newer directive or a swarm transition retired
-    // it) answers 410; unknown ids answer 404. The executed action's
-    // result is appended to the console thread / swarm chat as a
-    // master.chat line, so the transcript stays the source of truth.
-    if (req.method === 'POST' && segments.length === 2 && segments[0] === 'master' && segments[1] === 'confirm') {
-      const body = await readJsonBody(req);
-      if (typeof body.actionId !== 'string' || !body.actionId.trim()) {
-        throw httpError('bad_request', 'actionId must be a non-empty string');
+    // POST /api/v1/master/confirm (and legacy POST /api/master/confirm, or /api/v1/actions/:actionId/confirm) {actionId}
+    // executes exactly one ledger entry. Superseded answers 410; unknown answers 404.
+    // Repeating an already-executed action returns the cached receipt { executed: true, actionId }.
+    const isMasterConfirm = req.method === 'POST' && segments.length === 2 && segments[0] === 'master' && segments[1] === 'confirm';
+    const isActionConfirm = req.method === 'POST' && segments.length === 3 && segments[0] === 'actions' && segments[2] === 'confirm';
+    if (isMasterConfirm || isActionConfirm) {
+      let actionId;
+      if (isActionConfirm) {
+        actionId = segments[1]?.trim();
+      } else {
+        const body = await readJsonBody(req);
+        if (typeof body.actionId !== 'string' || !body.actionId.trim()) {
+          throw httpError('bad_request', 'actionId must be a non-empty string');
+        }
+        actionId = body.actionId.trim();
       }
-      const { action, entry } = await guardLedger.confirm(body.actionId);
+      if (executedActions.has(actionId)) {
+        return sendJson(res, 200, executedActions.get(actionId));
+      }
+      const { action, entry } = await guardLedger.confirm(actionId);
       await orchestrator.recordExecuted({ entry, action });
-      return sendJson(res, 200, { executed: true, actionId: body.actionId });
+      const receipt = { executed: true, actionId };
+      executedActions.set(actionId, receipt);
+      return sendJson(res, 200, receipt);
     }
 
-    // GET /api/node — node-scope read-back for the operator: console thread
+    // GET /api/v1/node & GET /api/node — node-scope read-back for the operator: console thread
     // tail, the pending confirm ledger with actionIds, the current guard
     // mode, and a compact summary of every known swarm. A read: it is never
     // gated, in any guard mode.
@@ -764,9 +818,13 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
     throw httpError('not_found', `no route for ${req.method} ${pathname}`);
   }
 
-  function sendJson(res, status, obj) {
+  function sendJson(res, status, obj, extraHeaders = {}) {
     const body = JSON.stringify(obj);
-    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.writeHead(status, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      ...extraHeaders
+    });
     res.end(body);
   }
 

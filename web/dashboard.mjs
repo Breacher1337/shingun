@@ -37,12 +37,13 @@ const TOKEN = localStorage.getItem('shingun.token'); // only used when the serve
 
 // ---- api ------------------------------------------------------------------
 
-async function api(path, { method = 'GET', body } = {}) {
+async function api(path, { method = 'GET', body, headers = {} } = {}) {
   const res = await fetch(path, {
     method,
     headers: {
       ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
-      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {})
+      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      ...headers
     },
     body: body !== undefined ? JSON.stringify(body) : undefined
   });
@@ -50,6 +51,11 @@ async function api(path, { method = 'GET', body } = {}) {
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = { error: { code: 'bad_response', message: text.slice(0, 300) } }; }
   if (!res.ok) throw new Error(data?.error?.message ?? `${method} ${path} → ${res.status}`);
+  if (data && typeof data === 'object') {
+    const loc = res.headers.get('Location');
+    if (loc) data._location = loc;
+    data._status = res.status;
+  }
   return data;
 }
 
@@ -328,7 +334,7 @@ function deckSpan(chip, text) {
 async function stopSwarm() {
   if (!state.swarmId) return;
   try {
-    const out = await api(`/api/swarms/${encodeURIComponent(state.swarmId)}/stop`, { method: 'POST', body: {} });
+    const out = await api(`/api/v1/swarms/${encodeURIComponent(state.swarmId)}`, { method: 'DELETE' });
     toast(out.already ? `swarm already ${out.already}` : 'swarm stopping — workers wind down');
   } catch (e) {
     toast(`stop failed: ${e.message}`, 'warn');
@@ -338,7 +344,7 @@ async function stopSwarm() {
 async function exportBundle() {
   if (!state.swarmId) return;
   try {
-    const res = await fetch(`/api/swarms/${encodeURIComponent(state.swarmId)}/bundle`, {
+    const res = await fetch(`/api/v1/swarms/${encodeURIComponent(state.swarmId)}/bundle`, {
       headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}
     });
     if (!res.ok) {
@@ -510,7 +516,7 @@ async function confirmAction(actionId, btn) {
   if (!actionId) return;
   btn.disabled = true;
   try {
-    await api('/api/master/confirm', { method: 'POST', body: { actionId } });
+    await api('/api/v1/master/confirm', { method: 'POST', body: { actionId } });
     btn.replaceWith(document.createTextNode('✓ confirmed — executing'));
   } catch (e) {
     btn.disabled = false;
@@ -571,7 +577,7 @@ async function sendDirective() {
     $('#deck-log').scrollTop = $('#deck-log').scrollHeight;
     const body = { text, guard: state.guard };
     if (swarmLive) body.swarm = state.swarmId;
-    const out = await api('/api/master/message', { method: 'POST', body });
+    const out = await api('/api/v1/master/messages', { method: 'POST', body });
     spin.remove();
     if (!out?.ok) throw new Error('master did not accept the directive');
     renderDeckStatus(swarmLive ? 'sent — watch the stream' : 'console — watch the thread');
@@ -659,7 +665,7 @@ async function loadDiff(wid) {
   const pre = $('#ins-diff');
   if (!pre) return;
   try {
-    const out = await api(`/api/swarms/${state.swarmId}/workers/${encodeURIComponent(wid)}/diff`);
+    const out = await api(`/api/v1/swarms/${state.swarmId}/workers/${encodeURIComponent(wid)}/diff`);
     pre.textContent = out.diff ?? '(empty diff)';
   } catch (e) {
     pre.textContent = `(no diff yet: ${e.message})`;
@@ -671,7 +677,7 @@ async function sendSteer(wid) {
   const text = input?.value?.trim();
   if (!text || !state.swarmId) return;
   try {
-    await api(`/api/swarms/${encodeURIComponent(state.swarmId)}/workers/${encodeURIComponent(wid)}/message`, {
+    await api(`/api/v1/swarms/${encodeURIComponent(state.swarmId)}/workers/${encodeURIComponent(wid)}/messages`, {
       method: 'POST', body: { text }
     });
     input.value = '';
@@ -901,7 +907,7 @@ async function startSse(swarmId) {
   const { signal } = sseAbort;
   for (;;) {
     try {
-      const res = await fetch(`/api/events?swarm=${encodeURIComponent(swarmId)}`, {
+      const res = await fetch(`/api/v1/events?swarm=${encodeURIComponent(swarmId)}`, {
         headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {},
         signal
       });
@@ -942,7 +948,7 @@ function stopConsoleProbe() {
 
 async function consoleStreamOnce(signal) {
   try {
-    const res = await fetch('/api/events', {
+    const res = await fetch('/api/v1/events', {
       headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {},
       signal
     });
@@ -969,7 +975,7 @@ async function startConsoleSse() {
 
 async function loadSwarm(swarmId) {
   try {
-    const snap = await api(`/api/swarms/${encodeURIComponent(swarmId)}`);
+    const snap = await api(`/api/v1/swarms/${encodeURIComponent(swarmId)}`);
     state.swarmId = snap.swarmId;
     state.status = snap.status;
     state.final = Boolean(snap.final);
@@ -1047,7 +1053,7 @@ async function openSettings() {
     h('div', { class: 'modal', id: 'settings-modal' }, h('h2', null, 'Settings'),
       h('div', { class: 'kv' }, 'scanning providers…')));
   app.append(modal);
-  const info = await api('/api/providers').catch((e) => null);
+  const info = await api('/api/v1/providers').catch((e) => null);
   if (!modal.isConnected) return; // closed while scanning
   if (!info) {
     modal.remove();
@@ -1111,8 +1117,8 @@ function renderSettings(modal, info, preferName) {
           const key = input.value.trim();
           if (takesKey && key) {
             try {
-              const res = await api('/api/provider-key', {
-                method: 'POST', body: { provider: selected, apiKey: key, activate: activate.checked }
+              const res = await api(`/api/v1/providers/${encodeURIComponent(selected)}/key`, {
+                method: 'PUT', body: { apiKey: key, activate: activate.checked }
               });
               toast(`key saved for ${res.provider}${res.activated ? ' — roles activated' : ''}`, 'flag', 12000);
             } catch (e) {
@@ -1121,7 +1127,7 @@ function renderSettings(modal, info, preferName) {
             }
           } else if (activate.checked) {
             try {
-              await api('/api/roles', { method: 'POST', body: { both: selected } });
+              await api('/api/v1/roles', { method: 'PUT', body: { both: selected } });
               toast(`master + worker now use ${selected}`, 'flag', 12000);
             } catch (e) {
               err.replaceChildren(`role switch failed: ${e.message}`);
@@ -1131,7 +1137,7 @@ function renderSettings(modal, info, preferName) {
             err.replaceChildren(takesKey ? 'paste a key, or tick “use for master + worker”' : 'tick “use for master + worker” to switch roles');
             return;
           }
-          const fresh = await api('/api/providers').catch(() => info);
+          const fresh = await api('/api/v1/providers').catch(() => info);
           renderSettings(modal, fresh, selected);
           checkProviders(); // sync the boot card with the new state
         }
@@ -1177,18 +1183,20 @@ function openChallengeModal() {
     go.disabled = true;
     go.textContent = 'ingesting…';
     try {
-      const ch = await api('/api/challenges', { method: 'POST', body: {
+      const ch = await api('/api/v1/challenges', { method: 'POST', body: {
         source, value,
         ...($('#nl-flag').value.trim() ? { flagFormatRegex: $('#nl-flag').value.trim() } : {}),
         ...($('#nl-cat').value ? { categoryHint: $('#nl-cat').value } : {})
       } });
+      const challengeId = ch.challengeId || (ch._location ? ch._location.split('/').pop() : ch.challengeId);
       go.textContent = 'starting swarm…';
-      const gen = await api(`/api/challenges/${encodeURIComponent(ch.challengeId)}/swarm`, { method: 'POST', body: {
+      const gen = await api(`/api/v1/challenges/${encodeURIComponent(challengeId)}/swarms`, { method: 'POST', body: {
         ...($('#nl-workers').value.trim() ? { workers: Number($('#nl-workers').value) } : {})
       } });
       modal.remove();
-      toast(`swarm ${gen.swarmId} launched`);
-      await loadSwarm(gen.swarmId);
+      const swarmId = gen.swarmId || (gen._location ? gen._location.split('/').pop() : gen.swarmId);
+      toast(`swarm ${swarmId} launched`);
+      await loadSwarm(swarmId);
     } catch (e) {
       go.disabled = false;
       go.textContent = 'ingest + launch swarm';
@@ -1207,7 +1215,7 @@ function openChallengeModal() {
 /** Scan providers; surface the launch-blocker card only when a role is stuck. */
 async function checkProviders() {
   let info = null;
-  try { info = await api('/api/providers'); } catch { return; /* scan degrades silently */ }
+  try { info = await api('/api/v1/providers'); } catch { return; /* scan degrades silently */ }
   hideKeyCard(); // idempotent; re-render with fresh state
   const issues = roleIssues(info);
   if (issues.length) showKeyCard(issues, info);
@@ -1250,7 +1258,7 @@ function showKeyCard(issues, info) {
           class: 'kbtn', onclick: async () => {
             err.replaceChildren();
             try {
-              await api('/api/roles', { method: 'POST', body: { both: keylessName } });
+              await api('/api/v1/roles', { method: 'PUT', body: { both: keylessName } });
               toast(`master + worker switched to ${keylessName} — keyless dry-run mode`, 'flag');
               hideKeyCard();
             } catch (e) {

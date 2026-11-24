@@ -18,7 +18,10 @@ const TOKEN = 't-' + 'a'.repeat(40);
 
 async function boot() {
   const ws = await tmpWorkspace('serve-');
-  const { config, env } = await loadConfig({ file: TEST_CONFIG, profile: 'low-power' });
+  const loaded = await loadConfig({ file: TEST_CONFIG, profile: 'low-power' });
+  const config = structuredClone(loaded.config);
+  config.roles = { master: { provider: 'mock', model: null }, worker: { provider: 'mock', model: null }, oracle: null };
+  const env = { ...loaded.env };
   const bus = createBus();
   const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, ws), env: { ...env, SHINGUN_TOKEN: TOKEN }, bus });
   const srv = await startServer({
@@ -29,12 +32,13 @@ async function boot() {
   });
   await srv.listen(0);
   const base = `http://127.0.0.1:${srv.server.address().port}`;
-  const call = async (p, { method = 'GET', body, auth = true } = {}) => {
+  const call = async (p, { method = 'GET', body, auth = true, headers = {} } = {}) => {
     const res = await fetch(base + p, {
       method,
       headers: {
         ...(auth ? { Authorization: `Bearer ${TOKEN}` } : {}),
-        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {})
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+        ...headers
       },
       body: body !== undefined ? JSON.stringify(body) : undefined
     });
@@ -153,6 +157,7 @@ test('acceptance 2a: server boots and gates everything behind the token', async 
     // Server binds localhost only.
     assert.equal(ctx.srv.server.address().address, '127.0.0.1');
   } finally {
+    await ctx.call('/api/v1/roles', { method: 'PUT', body: { both: 'mock' } }).catch(() => {});
     await teardown(ctx);
   }
 });
@@ -214,35 +219,43 @@ test('acceptance 2b: challenge → swarm visible end-to-end over HTTP + SSE', as
   const ctx = await boot();
   let swarmId = null;
   try {
-    // Register the challenge over HTTP.
-    const bad = await ctx.call('/api/challenges', { method: 'POST', body: { source: 'x', value: '' } });
+    // Register the challenge over HTTP with /api/v1/challenges (201 + Location).
+    const bad = await ctx.call('/api/v1/challenges', { method: 'POST', body: { source: 'x', value: '' } });
     assert.equal(bad.status, 400);
-    const ch = await ctx.call('/api/challenges', {
+    const ch = await ctx.call('/api/v1/challenges', {
       method: 'POST',
       body: { source: 'path', value: CHALLENGE, flagFormatRegex: 'shingun\\{[^}]*\\}' }
     });
-    assert.equal(ch.status, 200);
+    assert.equal(ch.status, 201, 'creation returns 201 Created');
+    assert.equal(ch.headers.get('location'), `/api/v1/challenges/${ch.body.challengeId}`, 'Location header set');
     const challengeId = ch.body.challengeId;
     assert.ok(challengeId);
 
-    const bad2 = await ctx.call(`/api/challenges/${challengeId}/swarm`, { method: 'POST', body: { workers: 99 } });
-    assert.equal(bad2.status, 200); // clamps to concurrency caps, not an error
+    // Read back challenge metadata via GET /api/v1/challenges/:id
+    const meta = await ctx.call(`/api/v1/challenges/${challengeId}`);
+    assert.equal(meta.status, 200);
+    assert.equal(meta.body.challengeId, challengeId);
+
+    // Launch swarm with /api/v1/challenges/:id/swarms (201 + Location).
+    const bad2 = await ctx.call(`/api/v1/challenges/${challengeId}/swarms`, { method: 'POST', body: { workers: 99 } });
+    assert.equal(bad2.status, 201, 'swarm creation returns 201 Created'); // clamps to concurrency caps, not an error
+    assert.equal(bad2.headers.get('location'), `/api/v1/swarms/${bad2.body.swarmId}`, 'Location header set');
     assert.ok(bad2.body.swarmId);
     swarmId = bad2.body.swarmId;
 
     // Unknown swarm reads are 404.
-    const unknown = await ctx.call('/api/swarms/sw-void');
+    const unknown = await ctx.call('/api/v1/swarms/sw-void');
     assert.equal(unknown.status, 404);
 
     // SSE backlog replays from event 0 for auth'd subscribers.
-    const sse = await fetch(`${ctx.base}/api/events?swarm=${swarmId}`, {
+    const sse = await fetch(`${ctx.base}/api/v1/events?swarm=${swarmId}`, {
       headers: { Authorization: `Bearer ${TOKEN}` }
     });
     assert.equal(sse.status, 200);
     assert.match(sse.headers.get('content-type') ?? '', /text\/event-stream/);
 
     // A second, later subscriber also gets the full backlog replay.
-    const back2 = await fetch(`${ctx.base}/api/events?swarm=${swarmId}`, {
+    const back2 = await fetch(`${ctx.base}/api/v1/events?swarm=${swarmId}`, {
       headers: { Authorization: `Bearer ${TOKEN}` }
     });
     const early = await sseCollect(back2, (evs) => evs.some((e) => e.type === 'worker.spawn'), 5000);
@@ -252,7 +265,7 @@ test('acceptance 2b: challenge → swarm visible end-to-end over HTTP + SSE', as
 
     // Swarm state reconstructs via replay: poll to solved.
     const solved = await waitFor(async () => {
-      const snap = await ctx.call(`/api/swarms/${swarmId}`);
+      const snap = await ctx.call(`/api/v1/swarms/${swarmId}`);
       assert.equal(snap.status, 200);
       return ['solved', 'stopped', 'capped'].includes(snap.body.status) ? snap.body : null;
     }, 60000);
@@ -273,7 +286,7 @@ test('acceptance 2b: challenge → swarm visible end-to-end over HTTP + SSE', as
     await sse.body.cancel().catch(() => {});
 
     // Flag trophy attribution.
-    const snap2 = await ctx.call(`/api/swarms/${swarmId}`);
+    const snap2 = await ctx.call(`/api/v1/swarms/${swarmId}`);
     const solvedWorker = snap2.body.workers.find((w) => (w.flags ?? []).includes('shingun{m0ck_fl4g}'));
     assert.ok(solvedWorker, 'a worker is attributed the flag');
   } finally {
@@ -285,16 +298,18 @@ test('acceptance 2c: command deck round-trip lands as master.chat over SSE', asy
   const ctx = await boot();
   let swarmId = null;
   try {
-    const ch = await ctx.call('/api/challenges', { method: 'POST', body: { source: 'path', value: CHALLENGE } });
-    const sw = await ctx.call(`/api/challenges/${ch.body.challengeId}/swarm`, { method: 'POST', body: { workers: 2 } });
+    const ch = await ctx.call('/api/v1/challenges', { method: 'POST', body: { source: 'path', value: CHALLENGE } });
+    assert.equal(ch.status, 201);
+    const sw = await ctx.call(`/api/v1/challenges/${ch.body.challengeId}/swarms`, { method: 'POST', body: { workers: 2 } });
+    assert.equal(sw.status, 201);
     swarmId = sw.body.swarmId;
 
     // The directive must run while the swarm is live (the swarm is still in
     // its spawn wave: worktree checkouts take far longer than this round-trip).
-    const sse = await fetch(`${ctx.base}/api/events?swarm=${swarmId}`, {
+    const sse = await fetch(`${ctx.base}/api/v1/events?swarm=${swarmId}`, {
       headers: { Authorization: `Bearer ${TOKEN}` }
     });
-    const res = await ctx.call('/api/master/message', {
+    const res = await ctx.call('/api/v1/master/messages', {
       method: 'POST', body: { swarm: swarmId, text: 'Give me a status report.' }
     });
     assert.equal(res.status, 200);
@@ -310,7 +325,7 @@ test('acceptance 2c: command deck round-trip lands as master.chat over SSE', asy
     assert.ok(masterReply, 'master reply streamed');
     assert.ok(Array.isArray(masterReply.data.actions), 'actions ride the reply');
     const withStatus = await waitFor(async () => {
-      const snap = await ctx.call(`/api/swarms/${swarmId}`);
+      const snap = await ctx.call(`/api/v1/swarms/${swarmId}`);
       const chat = snap.body.masterChat ?? [];
       return chat.length >= 2 ? chat : null;
     }, 20000);
@@ -320,48 +335,48 @@ test('acceptance 2c: command deck round-trip lands as master.chat over SSE', asy
     await sse.body.cancel().catch(() => {});
 
     // Steering a live worker queues a note, unknown ids are 404.
-    const snapA = await ctx.call(`/api/swarms/${swarmId}`);
+    const snapA = await ctx.call(`/api/v1/swarms/${swarmId}`);
     const wid = snapA.body.workers[0]?.id;
     if (wid) {
-      const steer = await ctx.call(`/api/swarms/${swarmId}/workers/${wid}/message`, {
+      const steer = await ctx.call(`/api/v1/swarms/${swarmId}/workers/${wid}/messages`, {
         method: 'POST', body: { text: 'prioritize the README' }
       });
       assert.equal(steer.status, 200);
       assert.equal(steer.body.queued, true);
     }
-    const steerBad = await ctx.call(`/api/swarms/${swarmId}/workers/w-void/message`, {
+    const steerBad = await ctx.call(`/api/v1/swarms/${swarmId}/workers/w-void/messages`, {
       method: 'POST', body: { text: 'x' }
     });
     assert.equal(steerBad.status, 404);
 
     // Diff endpoint: 200 with shape after settle, 404 for a worker that never ran.
     await ctx.orch.swarms.get(swarmId).done.catch(() => {});
-    const diffWid = (await ctx.call(`/api/swarms/${swarmId}`)).body.workers[0].id;
+    const diffWid = (await ctx.call(`/api/v1/swarms/${swarmId}`)).body.workers[0].id;
     const diff = await waitFor(async () => {
-      const d = await ctx.call(`/api/swarms/${swarmId}/workers/${diffWid}/diff`);
+      const d = await ctx.call(`/api/v1/swarms/${swarmId}/workers/${diffWid}/diff`);
       return d.status === 200 ? d : null;
     }, 15000);
     assert.ok(diff, 'diff is captured once the worker settles');
     assert.ok(diff.body.stats === null || typeof diff.body.stats.files === 'number', 'diff stats shape');
-    const diffNone = await ctx.call(`/api/swarms/${swarmId}/workers/w-none/diff`);
+    const diffNone = await ctx.call(`/api/v1/swarms/${swarmId}/workers/w-none/diff`);
     assert.equal(diffNone.status, 404);
 
-    // Stop route: terminal swarm reports already-stopped; unknown is 404.
-    const stop = await ctx.call(`/api/swarms/${swarmId}/stop`, { method: 'POST', body: {} });
+    // Stop route: DELETE /api/v1/swarms/:id reports already-stopped; unknown is 404.
+    const stop = await ctx.call(`/api/v1/swarms/${swarmId}`, { method: 'DELETE' });
     assert.equal(stop.status, 200);
     assert.equal(stop.body.stopped, true);
-    const stopUnknown = await ctx.call('/api/swarms/sw-void/stop', { method: 'POST', body: {} });
+    const stopUnknown = await ctx.call('/api/v1/swarms/sw-void', { method: 'DELETE' });
     assert.equal(stopUnknown.status, 404);
   } finally {
     await teardown(ctx, swarmId);
   }
 });
 
-test('acceptance 2e: provider key scan + provisioning (values never echo)', async () => {
+test('acceptance 2e: provider key scan + provisioning via PUT /api/v1/providers/:provider/key and PUT /api/v1/roles', async () => {
   const ctx = await boot();
   try {
     // Scan: metadata + booleans only — never key values.
-    const scan = await ctx.call('/api/providers');
+    const scan = await ctx.call('/api/v1/providers');
     assert.equal(scan.status, 200);
     assert.ok(scan.body.providers.mistral, 'mistral listed');
     assert.equal(scan.body.providers.mistral.type, 'openai-compat');
@@ -369,17 +384,17 @@ test('acceptance 2e: provider key scan + provisioning (values never echo)', asyn
     assert.equal(scan.body.providers.mock.hasKey, null, 'mock is keyless by design');
     assert.ok(typeof scan.body.providers.mistral.hasKey === 'boolean', 'hasKey is a boolean');
 
-    // Validation: weak keys and unknown providers are refused.
-    const bad = await ctx.call('/api/provider-key', { method: 'POST', body: { provider: 'mistral', apiKey: 'short' } });
+    // Validation: weak keys and unknown providers are refused via PUT /api/v1/providers/:provider/key.
+    const bad = await ctx.call('/api/v1/providers/mistral/key', { method: 'PUT', body: { apiKey: 'short' } });
     assert.equal(bad.status, 400, 'weak key refused');
-    const unknown = await ctx.call('/api/provider-key', { method: 'POST', body: { provider: 'void', apiKey: 'x'.repeat(12) } });
+    const unknown = await ctx.call('/api/v1/providers/void/key', { method: 'PUT', body: { apiKey: 'x'.repeat(12) } });
     assert.equal(unknown.status, 400, 'unknown provider refused');
-    const noKeyProvider = await ctx.call('/api/provider-key', { method: 'POST', body: { provider: 'mock', apiKey: 'x'.repeat(12) } });
+    const noKeyProvider = await ctx.call('/api/v1/providers/mock/key', { method: 'PUT', body: { apiKey: 'x'.repeat(12) } });
     assert.equal(noKeyProvider.status, 400, 'keyless provider refused');
 
-    // Provision: live env, durable .env, role activation, persisted config.
+    // Provision: live env, durable .env, role activation, persisted config via PUT.
     const KEY = 'sk-provision-0123456789abcdef';
-    const ok = await ctx.call('/api/provider-key', { method: 'POST', body: { provider: 'mistral', apiKey: KEY, activate: true } });
+    const ok = await ctx.call('/api/v1/providers/mistral/key', { method: 'PUT', body: { apiKey: KEY, activate: true } });
     assert.equal(ok.status, 200);
     assert.equal(ok.body.ok, true);
     assert.equal(ok.body.hasKey, true);
@@ -387,7 +402,13 @@ test('acceptance 2e: provider key scan + provisioning (values never echo)', asyn
     assert.equal(ok.body.persisted, true);
     assert.ok(!JSON.stringify(ok.body).includes(KEY), 'response never echoes the key');
 
-    const after = await ctx.call('/api/providers');
+    // Role switching via PUT /api/v1/roles
+    const roleOk = await ctx.call('/api/v1/roles', { method: 'PUT', body: { both: 'mistral' } });
+    assert.equal(roleOk.status, 200);
+    assert.equal(roleOk.body.roles.master.provider, 'mistral');
+    assert.equal(roleOk.body.roles.worker.provider, 'mistral');
+
+    const after = await ctx.call('/api/v1/providers');
     assert.equal(after.body.providers.mistral.hasKey, true, 'key visible as boolean');
     assert.equal(after.body.roles.master.provider, 'mistral', 'master role activated');
     assert.equal(after.body.roles.worker.provider, 'mistral', 'worker role activated');
@@ -398,7 +419,148 @@ test('acceptance 2e: provider key scan + provisioning (values never echo)', asyn
     const cfgText = await fs.readFile(path.join(ctx.ws, 'config.json'), 'utf8');
     assert.match(cfgText, /"provider"\s*:\s*"mistral"/, 'roles persisted to config file');
   } finally {
+    await ctx.call('/api/v1/roles', { method: 'PUT', body: { both: 'mock' } }).catch(() => {});
     await teardown(ctx);
+  }
+});
+
+test('acceptance 2f: Idempotency-Key support on creation endpoints caches and replays 201', async () => {
+  const ctx = await boot();
+  let swarmId = null;
+  try {
+    const KEY_CH = 'idem-challenge-' + Date.now();
+    const ch1 = await ctx.call('/api/v1/challenges', {
+      method: 'POST',
+      body: { source: 'path', value: CHALLENGE },
+      headers: { 'Idempotency-Key': KEY_CH }
+    });
+    assert.equal(ch1.status, 201);
+    assert.ok(ch1.body.challengeId);
+    assert.equal(ch1.headers.get('location'), `/api/v1/challenges/${ch1.body.challengeId}`);
+
+    // Replay with identical key: returns cached 201 without error or duplicate ingest
+    const ch2 = await ctx.call('/api/v1/challenges', {
+      method: 'POST',
+      body: { source: 'path', value: CHALLENGE },
+      headers: { 'Idempotency-Key': KEY_CH }
+    });
+    assert.equal(ch2.status, 201);
+    assert.equal(ch2.body.challengeId, ch1.body.challengeId);
+    assert.equal(ch2.headers.get('location'), ch1.headers.get('location'));
+
+    const KEY_SW = 'idem-swarm-' + Date.now();
+    const sw1 = await ctx.call(`/api/v1/challenges/${ch1.body.challengeId}/swarms`, {
+      method: 'POST',
+      body: { workers: 2 },
+      headers: { 'Idempotency-Key': KEY_SW }
+    });
+    assert.equal(sw1.status, 201);
+    assert.ok(sw1.body.swarmId);
+    swarmId = sw1.body.swarmId;
+
+    // Replay with identical key: returns cached 201 with same swarmId
+    const sw2 = await ctx.call(`/api/v1/challenges/${ch1.body.challengeId}/swarms`, {
+      method: 'POST',
+      body: { workers: 2 },
+      headers: { 'Idempotency-Key': KEY_SW }
+    });
+    assert.equal(sw2.status, 201);
+    assert.equal(sw2.body.swarmId, sw1.body.swarmId);
+  } finally {
+    await teardown(ctx, swarmId);
+  }
+});
+
+test('acceptance 2g: idempotent repeated confirm returns executed receipt without error', async () => {
+  const ctx = await boot();
+  try {
+    // Propose an action via majors mode directive
+    const r = await ctx.call('/api/v1/master/messages', {
+      method: 'POST',
+      body: { text: 'set up the easy fixture with three workers', guard: 'majors' }
+    });
+    assert.equal(r.status, 200);
+
+    const node = await ctx.call('/api/v1/node');
+    assert.equal(node.status, 200);
+    const chips = node.body.pending;
+    assert.ok(chips.length >= 1, 'action was gated as pending');
+    const actionId = chips[0].actionId;
+
+    // First confirm: executes the action and returns receipt
+    const c1 = await ctx.call('/api/v1/master/confirm', {
+      method: 'POST',
+      body: { actionId }
+    });
+    assert.equal(c1.status, 200);
+    assert.equal(c1.body.executed, true);
+    assert.equal(c1.body.actionId, actionId);
+
+    // Second confirm: returns cached executed receipt (NOT 404 action_unknown!)
+    const c2 = await ctx.call('/api/v1/master/confirm', {
+      method: 'POST',
+      body: { actionId }
+    });
+    assert.equal(c2.status, 200, 'idempotent repeat returns 200');
+    assert.equal(c2.body.executed, true);
+    assert.equal(c2.body.actionId, actionId);
+  } finally {
+    await ctx.call('/api/v1/roles', { method: 'PUT', body: { both: 'mock' } }).catch(() => {});
+    await teardown(ctx);
+  }
+});
+
+test('acceptance 2h: legacy /api/* routes backward compatibility as aliases/forwarders', async () => {
+  const ctx = await boot();
+  let swarmId = null;
+  try {
+    // Legacy GET /api/providers
+    const prov = await ctx.call('/api/providers');
+    assert.equal(prov.status, 200);
+    assert.ok(prov.body.providers);
+
+    // Legacy POST /api/challenges
+    const ch = await ctx.call('/api/challenges', {
+      method: 'POST',
+      body: { source: 'path', value: CHALLENGE }
+    });
+    assert.equal(ch.status, 201);
+    assert.ok(ch.body.challengeId);
+
+    // Legacy POST /api/challenges/:id/swarm
+    const sw = await ctx.call(`/api/challenges/${ch.body.challengeId}/swarm`, {
+      method: 'POST',
+      body: { workers: 2 }
+    });
+    assert.equal(sw.status, 201);
+    assert.ok(sw.body.swarmId);
+    swarmId = sw.body.swarmId;
+
+    // Legacy GET /api/swarms/:id
+    const snap = await ctx.call(`/api/swarms/${swarmId}`);
+    assert.equal(snap.status, 200);
+
+    // Legacy POST /api/master/message
+    const msg = await ctx.call('/api/master/message', {
+      method: 'POST',
+      body: { swarm: swarmId, text: 'legacy status report' }
+    });
+    assert.equal(msg.status, 200);
+
+    // Legacy POST /api/swarms/:id/stop
+    const stop = await ctx.call(`/api/swarms/${swarmId}/stop`, {
+      method: 'POST',
+      body: {}
+    });
+    assert.equal(stop.status, 200);
+    assert.equal(stop.body.stopped, true);
+
+    // Legacy GET /api/node
+    const node = await ctx.call('/api/node');
+    assert.equal(node.status, 200);
+    assert.ok(Array.isArray(node.body.swarms));
+  } finally {
+    await teardown(ctx, swarmId);
   }
 });
 

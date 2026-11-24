@@ -223,7 +223,7 @@ async function main() {
       } catch (e) {
         if (e.code !== 'swarm_unknown') throw e;
         // Not in this process: a running `serve` owns it — relay over HTTP.
-        const out = await serveRelay('POST', '/api/master/message', { swarm: swarmId, text }, config, env);
+        const out = await serveRelay('POST', '/api/v1/master/messages', { swarm: swarmId, text }, config, env);
         process.stdout.write(JSON.stringify({ ok: out.ok, via: 'serve' }) + '\n');
       }
       process.exit(0);
@@ -239,7 +239,7 @@ async function main() {
         if (e.code !== 'worker_unknown' && e.code !== 'swarm_unknown') throw e;
         const out = await serveRelay(
           'POST',
-          `/api/swarms/${encodeURIComponent(swarmId)}/workers/${encodeURIComponent(workerId)}/message`,
+          `/api/v1/swarms/${encodeURIComponent(swarmId)}/workers/${encodeURIComponent(workerId)}/messages`,
           { text: words.join(' ') }, config, env
         );
         process.stdout.write(JSON.stringify({ ...out, via: 'serve' }) + '\n');
