@@ -189,8 +189,8 @@
   <h1>shingun <span>進軍 · design language</span></h1>
   <span class="grow"></span>
   <button class="themebtn" data-set-theme="cocytus">cocytus</button>
-  <button class="themebtn" data-set-theme="obsidian">obsidian</button>
-  <button class="themebtn" data-set-theme="ember">ember</button>
+  <button class="themebtn" data-set-theme="albedo">albedo</button>
+  <button class="themebtn" data-set-theme="demiurge">demiurge</button>
 </header>
 
 <main>
@@ -203,9 +203,9 @@
       (<code>shingun.theme</code>).</p>
     <table>
       <tr><th>theme</th><th>identity</th><th>when to wear</th></tr>
-      <tr><td><code>cocytus</code></td><td>frozen river — cold slate blues, ice-water text</td><td>default; daytime missions, screen-share, anything public-facing</td></tr>
-      <tr><td><code>obsidian</code></td><td>volcanic glass — neutral blacks, chiseled whites</td><td>low-light operator pits, maximum contrast, projector walls</td></tr>
-      <tr><td><code>ember</code></td><td>night-ops charcoal — warm hearth tones, amber signals</td><td>long overnight sessions, tired eyes</td></tr>
+      <tr><td><code>cocytus</code></td><td>the frozen river — glacier teal over dark water</td><td>default; daytime missions, screen-share, anything public-facing</td></tr>
+      <tr><td><code>albedo</code></td><td>volcanic glass — neutral blacks, chiseled whites</td><td>low-light operator pits, maximum contrast, projector walls</td></tr>
+      <tr><td><code>demiurge</code></td><td>night-ops charcoal — warm hearth tones, amber signals</td><td>long overnight sessions, tired eyes</td></tr>
     </table>
   </section>
 
@@ -364,6 +364,7 @@
 <script>
   // Theme switching: attribute on <html>, remembered per browser.
   const KEY = 'shingun.theme';
+  const THEMES = ['cocytus', 'albedo', 'demiurge'];
   const buttons = [...document.querySelectorAll('.themebtn')];
   const apply = (theme) => {
     document.documentElement.dataset.theme = theme;
@@ -377,6 +378,7 @@
   buttons.forEach((b) => b.addEventListener('click', () => apply(b.dataset.setTheme)));
   let saved = 'cocytus';
   try { saved = localStorage.getItem(KEY) || 'cocytus'; } catch { /* unavailable */ }
+  if (!THEMES.includes(saved)) saved = 'cocytus'; // retired theme names fall home
   apply(saved);
 </script>
 </body>

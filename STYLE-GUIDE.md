@@ -27,9 +27,9 @@ Three uniforms, one language. Switching is instant and survives restarts.
 
 | Theme | Identity | Wear it when |
 | --- | --- | --- |
-| `cocytus` *(flagship, default)* | the frozen river — cold slate blues, ice-water text, signal hues tuned for long log-reading | daytime missions, screen shares, anything public-facing |
-| `obsidian` | volcanic glass — pure neutral blacks, chiseled whites, contrast-first | low-light operator pits, projector walls, maximum-contrast needs |
-| `ember` | night-ops charcoal — warm hearth tones, amber signal fires | long overnight sessions, tired eyes |
+| `cocytus` *(flagship, default)* | the frozen river — glacier teal over dark water, signal hues tuned for long log-reading | daytime missions, screen shares, anything public-facing |
+| `albedo` | volcanic glass — pure neutral blacks, chiseled whites, contrast-first | low-light operator pits, projector walls, maximum-contrast needs |
+| `demiurge` | night-ops charcoal — warm hearth tones, amber signal fires | long overnight sessions, tired eyes |
 
 Rules:
 
@@ -124,7 +124,7 @@ reachable.
 1. **Contrast:** 4.5:1 minimum for body text on any surface pair actually
    used; 3:1 for large type and state indicators.
 2. **Never color alone:** every status carries a label (and usually a dot
-   and a shape). The `stalled` pill reads in `obsidian` at a glance without
+   and a shape). The `stalled` pill reads in `albedo` at a glance without
    knowing which theme you are wearing.
 3. **Focus is visible:** interactive elements own a `--focus-color` ring on
    `:focus-visible`. Keyboard operation is a first-class mission path.

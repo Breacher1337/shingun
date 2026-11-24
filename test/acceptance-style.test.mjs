@@ -32,7 +32,7 @@ async function boot({ token = null } = {}) {
   return { srv, ws, base: `http://127.0.0.1:${srv.server.address().port}`, token };
 }
 
-const THEMES = ['cocytus', 'obsidian', 'ember'];
+const THEMES = ['cocytus', 'albedo', 'demiurge'];
 const STATUS_TOKENS = ['spawn', 'reasoning', 'tool', 'stall', 'solved', 'finish', 'dead'];
 
 test('acceptance style: tokens.css serves complete across all three themes', async () => {
@@ -54,8 +54,11 @@ test('acceptance style: tokens.css serves complete across all three themes', asy
         );
       }
     }
-    // Obsidian and ember are real [data-theme] overrides, not comments.
-    assert.ok(css.includes('[data-theme="obsidian"]') && css.includes('[data-theme="ember"]'));
+    // Albedo and demiurge are real [data-theme] overrides, not comments.
+    assert.ok(css.includes('[data-theme="albedo"]') && css.includes('[data-theme="demiurge"]'));
+    // The flagship wears teal; status hues stay untouched by brand changes.
+    assert.ok(/--accent:\s*#0f766e;/.test(css));
+    assert.match(css, /--status-reasoning:\s*#4da3ff;/);
     // Shared, theme-independent scales live exactly once in :root.
     assert.equal((css.match(/--sp-8:/g) ?? []).length, 1);
     assert.equal((css.match(/--fs-base:/g) ?? []).length, 1);

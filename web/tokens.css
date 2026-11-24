@@ -3,9 +3,9 @@
  *
  * One file, zero dependencies. Three complete themes:
  *
- *   cocytus   flagship — the frozen river palette the mission console wears
- *   obsidian  maximum-contrast volcanic glass for low-light operator pits
- *   ember     warm night-ops charcoal for long sessions
+ *   cocytus   flagship — glacier teal over dark river water
+ *   albedo    maximum-contrast volcanic glass for low-light operator pits
+ *   demiurge  warm night-ops charcoal for long sessions
  *
  * Contract:
  *   - Shared scales (type, space, radius, motion, elevation, z, focus) are
@@ -77,8 +77,8 @@
 }
 
 /* ------------------------------------------------- theme: cocytus (flagship) */
-/* Frozen river of the ninth circle: cold slate blues, ice-water text,
- * signal hues that read against a long night of logs. */
+/* Cocytus, the frozen river: glacier teal over dark water, ice-green
+ * signal light, status hues that read against a long night of logs. */
 
 :root,
 [data-theme="cocytus"] {
@@ -100,9 +100,9 @@
   --text-faint: #4a5560;
 
   /* brand */
-  --accent: #2b6cb0;
-  --accent-strong: #4da3ff;
-  --accent-soft: rgba(77, 163, 255, 0.14);
+  --accent: #0f766e;
+  --accent-strong: #2fdec6;
+  --accent-soft: rgba(47, 222, 198, 0.12);
 
   /* status — worker and swarm states */
   --status-spawn: #888888;
@@ -129,11 +129,11 @@
   --ok-soft: var(--status-solved-soft);
 }
 
-/* ------------------------------------------------------- theme: obsidian --- */
+/* ------------------------------------------------------- theme: albedo ---- */
 /* Volcanic glass: neutral blacks, chiseled whites, status hues cooled
- * to sit on pure graphite. Maximum contrast, zero blue haze. */
+ * to sit on pure graphite. Maximum contrast, zero haze. */
 
-[data-theme="obsidian"] {
+[data-theme="albedo"] {
   --surface-0: #020202;
   --surface-1: #090909;
   --surface-2: #101010;
@@ -168,11 +168,11 @@
   --status-dead-soft: rgba(176, 74, 74, 0.15);
 }
 
-/* ---------------------------------------------------------- theme: ember --- */
+/* ------------------------------------------------------- theme: demiurge -- */
 /* Night-ops charcoal: warm hearth glass, amber signal fires, status hues
  * muted to co-exist with the heat. For long sessions in dark rooms. */
 
-[data-theme="ember"] {
+[data-theme="demiurge"] {
   --surface-0: #0d0a08;
   --surface-1: #151009;
   --surface-2: #1c1610;
