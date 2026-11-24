@@ -5,6 +5,7 @@ import { ingestChallenge } from './ingest.mjs';
 import { buildBundle } from './bundle.mjs';
 import { createGuardLedger } from './ledger.mjs';
 import { preflightRoleProviders } from './providers/preflight.mjs';
+import { resolveApiKey } from './providers/registry.mjs';
 import { listTree, nowIso, writeJson } from './util.mjs';
 
 /**
@@ -475,10 +476,11 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
           type: prov.type ?? null,
           baseUrl: prov.type === 'openai-compat' ? (prov.baseUrl ?? null) : null,
           defaultModel: prov.defaultModel ?? null,
-          apiKeyEnv: prov.type === 'openai-compat' ? (prov.apiKeyEnv ?? null) : null,
+          // Entries without their own var share the universal OPENAI_API_KEY.
+          apiKeyEnv: prov.type === 'openai-compat' ? (prov.apiKeyEnv ?? 'OPENAI_API_KEY') : null,
           // null → keyless by design (mock); boolean → key present or not
           hasKey: prov.type === 'openai-compat'
-            ? Boolean(env?.[prov.apiKeyEnv] ?? process.env[prov.apiKeyEnv])
+            ? Boolean(resolveApiKey(prov, env))
             : null
         };
       }
@@ -492,9 +494,12 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
       const name = isProviderKeyPut ? segments[1] : (typeof body.provider === 'string' ? body.provider : '');
       const prov = config.providers?.[name];
       if (!prov) throw httpError('bad_request', `unknown provider "${name}"`);
-      if (prov.type !== 'openai-compat' || !prov.apiKeyEnv) {
+      if (prov.type !== 'openai-compat') {
         throw httpError('bad_request', `provider "${name}" takes no API key`);
       }
+      // Entries with their own var keep it; the rest live on the universal
+      // OPENAI_API_KEY so switching endpoint stays a config change.
+      const keyVar = prov.apiKeyEnv ?? 'OPENAI_API_KEY';
       const key = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
       if (key.length < 8 || /\s/.test(key)) {
         throw httpError('bad_request', 'apiKey must be at least 8 characters with no whitespace');
@@ -504,9 +509,9 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
       }
       // Live: the env object is shared with the orchestrator and providers
       // are built per spawn, so the key applies without a restart.
-      env[prov.apiKeyEnv] = key;
+      env[keyVar] = key;
       // Durable: upsert into the operator .env so restarts keep the key.
-      const persisted = envFile ? await upsertEnvValue(envFile, prov.apiKeyEnv, key) : false;
+      const persisted = envFile ? await upsertEnvValue(envFile, keyVar, key) : false;
       // Optional activation: swap the master/worker role providers live and
       // persist the roles to the operator config.
       let activated = false;

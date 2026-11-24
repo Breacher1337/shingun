@@ -93,7 +93,10 @@ Read this before running it against anything real.
 concurrency caps, worker limits, stall detection, the memory-watermark
 admission gate, budgets, providers, the command denylist, and role →
 provider wiring. The `low-power` profile lowers concurrency for small
-machines.
+machines. Providers are OpenAI-compatible: an entry with `apiKeyEnv` reads
+its own environment variable, and entries without one share the universal
+`OPENAI_API_KEY` — switching provider is a config change, not an
+environment rename.
 
 ## Workspace layout
 
