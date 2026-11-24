@@ -55,3 +55,28 @@ test('acceptance 4c: budget guard estimate-then-reconcile trips caps', async () 
   assert.equal(pre2.ok, false);
   assert.equal(pre2.capName, 'maxTokens');
 });
+
+test('acceptance 4c-2: caps are per-scope — nested scopes never double-count', () => {
+  const guard = createBudgetGuard();
+  for (const w of ['w1', 'w2', 'w3']) guard.addScope(`worker:${w}`, { tokenCap: 150000 });
+  guard.addScope('challenge:c1');
+  guard.addScope('swarm:s1');
+  const ids = (w) => [`worker:${w}`, 'challenge:c1', 'swarm:s1'];
+  // Real-workload shape: every call mirrors into worker + challenge + swarm.
+  for (const w of ['w1', 'w2', 'w3']) {
+    guard.record({ scopeIds: ids(w), tokensIn: 25000, tokensOut: 2000, priceIn: 0.7, priceOut: 2.1 });
+  }
+  // w1's own books: 27k of its own 150k cap. The challenge and swarm scopes
+  // both mirror 81k — summing them against the worker cap was the
+  // double-count that capped real workers at ~18% of their budget (#36).
+  const pre = guard.preflight({ scopeIds: ids('w1'), estTokens: 8000, priceIn: 0.7, priceOut: 2.1 });
+  assert.equal(pre.ok, true, 'a worker far from its own cap is admitted');
+  // The estimate crossing the worker's OWN cap still refuses, naming it.
+  const pre2 = guard.preflight({ scopeIds: ids('w1'), estTokens: 140000, priceIn: 0.7, priceOut: 2.1 });
+  assert.equal(pre2.ok, false);
+  assert.equal(pre2.capName, 'maxTokens');
+  assert.equal(pre2.scopeId, 'worker:w1');
+  // A scope crossing its own cap on reconcile still trips cleanly.
+  const rec = guard.record({ scopeIds: ids('w1'), tokensIn: 130000, tokensOut: 0, priceIn: 0.7, priceOut: 2.1 });
+  assert.ok(rec.crossed.some((c) => c.scopeId === 'worker:w1'), 'the worker scope crossing is reported');
+});
