@@ -2,7 +2,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs, { mkdir } from 'node:fs/promises';
-import { loadConfig, resolveWorkspace } from '../src/config.mjs';
+import { loadConfig } from '../src/config.mjs';
 import { createBus } from '../src/bus.mjs';
 import { createOrchestrator } from '../src/orchestrator.mjs';
 import { ingestChallenge } from '../src/ingest.mjs';
@@ -21,7 +21,7 @@ async function statusScan(workspaceDir) {
     if (!entry.isDirectory()) continue;
     const evDir = path.join(challengesDir, entry.name, 'events');
     const files = await fs.readdir(evDir).catch(() => []);
-    for (const f of files.filter((x) => x.endsWith('.jsonl'))) {
+    for (const f of files.filter((x) => x.endsWith('.jsonl') && x !== 'mcp.jsonl')) {
       const swarmId = f.replace(/\.jsonl$/, '');
       const events = await replayFile(path.join(evDir, f)).catch(() => []);
       if (!events.length) continue;
@@ -35,15 +35,13 @@ async function statusScan(workspaceDir) {
         if (e.type === 'worker.status') w.status = e.data.status;
         workers.set(e.worker, w);
       }
-      const usage = events.filter((e) => e.type === 'usage.tick').reduce((n, e) => n + (Number(e.data.costUsd) || 0), 0);
       out.push({
         swarmId,
         challengeId: entry.name,
         status: lastUpdate?.data?.final ? lastUpdate.data.status : (lastUpdate?.data?.status ?? 'planning'),
         final: Boolean(lastUpdate?.data?.final),
         flags,
-        workers: [...workers.values()],
-        spentUsd: Number(usage.toFixed(5))
+        workers: [...workers.values()]
       });
     }
   }
@@ -99,11 +97,12 @@ function parseArgs(argv) {
 
 function usage(code = 1) {
   process.stdout.write(
-    `shingun (進軍) — swarm CTF attacks on localhost
+    `shingun (進軍) — headless CTF tool server & swarm runner on localhost
 
 Usage:
-  shingun run <repoUrl|localPath|archiveUrl> [--target URL] [--target-note NOTE] [--challenge-id ID] [--workers N] [--budget-usd X] [--flag-format REGEX] [--category C] [--profile P] [--config FILE] [--workspace DIR]
   shingun serve [--port N] [--profile P] [--config FILE] [--workspace DIR]
+  shingun mcp [--profile P] [--config FILE] [--workspace DIR]
+  shingun run <repoUrl|localPath|archiveUrl> [--target URL] [--target-note NOTE] [--challenge-id ID] [--workers N] [--flag-format REGEX] [--category C] [--profile P] [--config FILE] [--workspace DIR]
   shingun status [--workspace DIR]
   shingun init-config
   shingun bundle <swarmId> [--workspace DIR]
@@ -124,7 +123,9 @@ async function main() {
     profile,
     envFile: path.join(HERE, '.env')
   });
-  const workspaceDir = resolveWorkspace(config, typeof args.workspace === 'string' ? args.workspace : null);
+  const workspaceDir = typeof args.workspace === 'string'
+    ? path.resolve(args.workspace)
+    : path.resolve(HERE, config.workspace);
   const bus = createBus();
   const orch = createOrchestrator({ config, workspaceDir, env, bus });
 
@@ -276,15 +277,15 @@ async function main() {
       const srv = await startServer({
         config, env, orchestrator: orch, bus, workspaceDir,
         envFile: path.join(HERE, '.env'),
-        webDir: path.join(HERE, 'web'),
         configFile
       });
       await srv.listen(port);
       process.stdout.write(`shingun (進軍) serving on ${srv.url}\n`);
-      process.stdout.write(`dashboard: ${srv.dashboardUrl}\n`);
+      process.stdout.write(`status: ${srv.url}\n`);
+      process.stdout.write(`mcp: ${srv.url}mcp\n`);
       process.stdout.write(srv.gated
         ? `auth: token-gated (SHINGUN_TOKEN from .env)\n`
-        : `auth: open workspace (set SHINGUN_TOKEN in .env to gate this dashboard)\n`);
+        : `auth: open workspace (set SHINGUN_TOKEN in .env to gate this server)\n`);
       if (resumed.length) {
         process.stdout.write(`resumed swarms (in-flight before restart): ${resumed.join(', ')}\n`);
       }
@@ -293,6 +294,15 @@ async function main() {
       };
       process.on('SIGINT', shutdown);
       process.on('SIGTERM', shutdown);
+      break;
+    }
+    case 'mcp': {
+      const { createMcpServer } = await import('../src/mcp.mjs');
+      const mcp = createMcpServer({ orchestrator: orch, bus, workspaceDir });
+      process.on('SIGINT', () => { mcp.closeAll(); process.exit(0); });
+      process.on('SIGTERM', () => { mcp.closeAll(); process.exit(0); });
+      await mcp.serveStdio();
+      process.exit(0);
       break;
     }
     default:

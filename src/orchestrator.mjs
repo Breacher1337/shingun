@@ -15,7 +15,7 @@ import { preflightRoleProviders } from './providers/preflight.mjs';
 import { readNotes, buildDigestInput, fallbackDigest } from './notes.mjs';
 import { renderPostmortem, writePostmortem } from './postmortem.mjs';
 import { envSecrets } from './config.mjs';
-import { ingestChallenge } from './ingest.mjs';
+import { ingestChallenge, validateTarget } from './ingest.mjs';
 import { newId, ensureDir, writeJson, listTree } from './util.mjs';
 
 /**
@@ -28,7 +28,6 @@ import { newId, ensureDir, writeJson, listTree } from './util.mjs';
 export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSample = sampleMemAvailable }) {
   const scrubber = createScrubber(envSecrets(env));
   const runner = createLocalRunner({ config });
-  const guard = createBudgetGuard({ onCapped: () => {} });
   const swarms = new Map(); // swarmId → runtime state
 
   const challengesDir = path.join(workspaceDir, 'challenges');
@@ -75,8 +74,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
     const eventsFile = path.join(chDir, 'events', `${swarmId}.jsonl`);
     await ensureDir(path.dirname(eventsFile));
     const store = await openEventStore(eventsFile, { swarmId });
-    guard.addScope(`challenge:${cid}`, { usdCap: opts.budgetUsd ?? config.budget.perChallengeUsd });
-    guard.addScope(`swarm:${swarmId}`, { usdCap: opts.budgetUsd ?? config.budget.perSwarmUsd });
+    const capGuard = createBudgetGuard({ usdCap: opts.budgetUsd ?? config.budget.perSwarmUsd });
 
     const s = {
       id: swarmId,
@@ -84,6 +82,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
       challenge,
       chDir,
       store,
+      capGuard,
       status: 'planning',
       workers: new Map(),
       flags: [],
@@ -197,7 +196,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
       dirs,
       lane: workerLane.lane,
       provider: getProviderFor(workerLane.role, { logSink: path.join(s.chDir, 'transcripts', `${wid}.outbound.jsonl`) }),
-      budgetGuard: guard, config,
+      budgetGuard: s.capGuard, config,
       emit: async (type, data) => {
         if (type === 'worker.progress') {
           w.steps = data.steps; w.tokensIn = data.tokensIn; w.tokensOut = data.tokensOut;
@@ -353,9 +352,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
     const events = await s.store.replay();
     const content = renderPostmortem({
       swarm: {
-        id: s.id, status: s.status, solvedBy: s.solvedBy,
-        spentTokens: guard.snapshot()?.[`swarm:${s.id}`]?.tokens ?? 0,
-        spentUsd: guard.snapshot()?.[`swarm:${s.id}`]?.usd ?? 0
+        id: s.id, status: s.status, solvedBy: s.solvedBy
       },
       challenge: {
         id: s.challengeId, sourceType: s.challenge.sourceType, sourceValue: s.challenge.sourceValue,
@@ -384,14 +381,9 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
   function statusSummary(swarmId) {
     const s = swarms.get(swarmId);
     if (!s) return null;
-    const snap = guard.snapshot();
     return {
       swarmId: s.id, challengeId: s.challengeId, status: s.status,
       solvedBy: s.solvedBy, respawns: s.respawns,
-      budget: {
-        swarmTokens: snap[`swarm:${s.id}`]?.tokens ?? 0,
-        swarmUsd: snap[`swarm:${s.id}`]?.usd ?? 0
-      },
       flags: s.flags,
       workers: [...s.workers.values()].map((w) => ({
         id: w.id, persona: w.persona, status: w.lastStatus, steps: w.steps,
@@ -470,33 +462,35 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
     return Object.assign(new Error(message), { code });
   }
 
-  /** Challenge registration, shared with the console create_challenge tool. */
-  async function createChallenge({ source, value, flagFormatRegex, categoryHint, target } = {}) {
-    const safeTarget = target && typeof target === 'object' && /^https?:\/\/.+/i.test(String(target.url ?? '').trim())
-      ? { url: String(target.url).trim(), note: target.note ? String(target.note).slice(0, 500) : undefined }
-      : null;
-    if (target && !safeTarget) {
-      throw engineError('bad_request', 'target must be {url, note?} with an http(s) url');
-    }
+  /** Challenge registration, shared by console create_challenge, HTTP ingest, and MCP. */
+  async function createChallenge({ source, value, title, hint, flagFormatRegex, categoryHint, target, maxBytes, challengeId } = {}) {
+    const safeTarget = validateTarget(target);
     if (!source && safeTarget) {
-      source = 'none'; // pure live-web challenge: the target is the challenge
+      source = 'none'; // pure live-web/tcp challenge: the target is the challenge
     }
-    if (source !== 'url' && source !== 'path' && source !== 'download' && source !== 'none') {
-      throw engineError('bad_request', 'source must be "url" (git), "path" (folder), or "download" (archive/file URL) — or pass a target for a pure live-web challenge');
+    const allowed = ['url', 'path', 'download', 'upload', 'none'];
+    if (!allowed.includes(source)) {
+      throw engineError('bad_request', 'source must be "url" (git), "path" (folder/file), "download" (archive/file URL), or "upload" — or pass a target');
     }
-    if (source !== 'none' && (typeof value !== 'string' || !value.trim())) {
+    if (source !== 'none' && source !== 'upload' && (typeof value !== 'string' || !value.trim())) {
       throw engineError('bad_request', 'value must be a non-empty string');
     }
     await ensureDir(challengesDir);
     const ing = await ingestChallenge({
-      source, value: source === 'none' ? '' : value.trim(),
-      challengesDir, target: safeTarget
+      source,
+      value: source === 'none' ? '' : source === 'upload' ? value : value.trim(),
+      challengesDir,
+      challengeId,
+      target: safeTarget,
+      maxBytes
     });
     const chDir = path.join(challengesDir, ing.challengeId);
     await writeJson(path.join(chDir, 'challenge.json'), {
       challengeId: ing.challengeId,
       sourceType: source,
-      sourceValue: source === 'none' ? '' : value.trim(),
+      sourceValue: source === 'upload' ? (value?.filename || 'upload.bin') : source === 'none' ? '' : value.trim(),
+      title: typeof title === 'string' ? title.slice(0, 120) : null,
+      hint: typeof hint === 'string' ? hint.slice(0, 500) : null,
       target: ing.target ?? null,
       flagFormatRegex: typeof flagFormatRegex === 'string' ? flagFormatRegex : null,
       categoryHint: typeof categoryHint === 'string' ? categoryHint : null,
@@ -607,7 +601,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
       }
     }
     const eventFiles = await fs.readdir(path.join(chDir, 'events')).catch(() => []);
-    for (const f of eventFiles.filter((x) => x.endsWith('.jsonl'))) {
+    for (const f of eventFiles.filter((x) => x.endsWith('.jsonl') && x !== 'mcp.jsonl')) {
       const store = await openEventStore(path.join(chDir, 'events', f), { swarmId: f.replace(/\.jsonl$/, '') });
       const events = await store.replay();
       const lastUpdate = [...events].reverse().find((e) => e.type === 'swarm.update');
@@ -729,7 +723,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
       if (!d.isDirectory()) continue;
       const evDir = path.join(challengesDir, d.name, 'events');
       const files = await fs.readdir(evDir).catch(() => []);
-      for (const f of files.filter((x) => x.endsWith('.jsonl'))) {
+      for (const f of files.filter((x) => x.endsWith('.jsonl') && x !== 'mcp.jsonl')) {
         const swarmId = f.replace(/\.jsonl$/, '');
         if (swarms.has(swarmId)) continue;
         const store = await openEventStore(path.join(evDir, f), { swarmId });
@@ -790,6 +784,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
 
         const s = {
           id: swarmId, challengeId: cid, challenge, chDir, store,
+          capGuard: createBudgetGuard({ usdCap: config.budget.perSwarmUsd }),
           status: 'running', workers: new Map(perWorker), flags,
           respawns: 0,
           deadStrategies: events.filter((e) => e.type === 'worker.pruned').map((e) => ({ persona: e.data.persona ?? 'unknown', note: e.data.reason ?? '' })),
@@ -854,7 +849,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
     startSwarm, resume, stop, steerWorker, directive, directiveConsole,
     createChallenge, createSwarm, purgeSwarm, removeChallenge, statusNode,
     appendConsoleChat, recordExecuted, getConsoleStore, statusSummary,
-    activeWorkerCount, guard, swarms,
+    activeWorkerCount, swarms,
     emitAll: () => [...swarms.keys()]
   };
 }

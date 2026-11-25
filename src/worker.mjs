@@ -75,14 +75,6 @@ export async function runWorker({
   let tokensIn = 0;
   let tokensOut = 0;
   let proseStrikes = 0;
-  const scopeIds = [`worker:${workerId}`, `challenge:${challengeId}`, `swarm:${swarmId}`];
-  budgetGuard.addScope(`worker:${workerId}`, { tokenCap: caps.maxTokens });
-  if (lane) {
-    // Lane attribution gets its own ledger line; uncapped by default so the
-    // line reports spend without tightening any per-worker/challenge/swarm cap.
-    budgetGuard.addScope(`lane:${lane}`);
-    scopeIds.push(`lane:${lane}`);
-  }
 
   const status = (s, reason) => emit('worker.status', { status: s, reason });
   const progress = () => emit('worker.progress', { steps, tokensIn, tokensOut, seenAt: Date.now() });
@@ -103,11 +95,11 @@ export async function runWorker({
     }
 
     const estTokens = Math.ceil(messages.reduce((n, m) => n + String(m.content ?? '').length, 0) / 4);
-    const pre = budgetGuard.preflight({ scopeIds, estTokens, priceIn: price.in, priceOut: price.out });
+    const pre = budgetGuard.preflight({ estTokens, priceIn: price.in, priceOut: price.out });
     if (!pre.ok) {
-      emit('budget.capped', { scope: pre.scope, capName: pre.capName, scopeId: pre.scopeId });
-      status('capped', pre.capName);
-      return { outcome: 'capped', reason: pre.capName };
+      emit('budget.capped', { capName: pre.capName, reason: pre.message });
+      status('capped', pre.message);
+      return { outcome: 'capped', reason: pre.message };
     }
 
     let res;
@@ -123,9 +115,9 @@ export async function runWorker({
       return { outcome: 'errored', error: e };
     }
 
-    const rec = budgetGuard.record({ scopeIds, tokensIn: res.usage.tokensIn, tokensOut: res.usage.tokensOut, priceIn: price.in, priceOut: price.out });
-    for (const c of rec.crossed ?? []) {
-      emit('budget.capped', { scope: c.scopeId.split(':')[0], capName: c.capName, scopeId: c.scopeId });
+    const rec = budgetGuard.record({ tokensIn: res.usage.tokensIn, tokensOut: res.usage.tokensOut, priceIn: price.in, priceOut: price.out });
+    if (rec.crossed) {
+      emit('budget.capped', { capName: 'usdCap', reason: rec.message });
     }
     tokensIn += res.usage.tokensIn;
     tokensOut += res.usage.tokensOut;
@@ -133,7 +125,6 @@ export async function runWorker({
       role: 'worker', provider: provider.name ?? 'unknown',
       ...(lane ? { lane } : {}),
       tokensIn: res.usage.tokensIn, tokensOut: res.usage.tokensOut,
-      costUsd: (res.usage.tokensIn / 1e6) * price.in + (res.usage.tokensOut / 1e6) * price.out,
       workerId
     });
 

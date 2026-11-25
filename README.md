@@ -1,134 +1,160 @@
 # shingun (進軍)
 
-Drop in a challenge. A master agent plans, a swarm of worker agents executes
-with real shells, and you watch the flags land — all on your own machine.
+Headless CTF tool server and event store for agent workflows (Vibe, Antigravity,
+or any MCP / HTTP client). Zero runtime dependencies — pure Node.js ESM.
 
-shingun is a fully local, zero-dependency system for running autonomous AI
-agents against security challenges (CTF-style). One Node.js process serves a
-live dashboard on `127.0.0.1` while agent swarms work the challenge: each
-worker gets its own git worktree and a jailed shell, every step streams to
-the dashboard as events, every dollar is capped in code before a provider is
-called, and every run leaves a reviewable trail — transcripts, diffs,
-post-mortem, export bundle.
+Your reasoning agent drives; shingun handles CTF ingest (git, local folders,
+`.zip`/`.tar.gz` archives, single binaries, `http(s)://` and `tcp://` targets),
+persistent bidirectional TCP sessions (`tcp_session`), jailed artifact reads/searches,
+append-only JSONL event logging, and an optional headless swarm runner.
 
 ## Requirements
 
-- Node.js ≥ 20 (ESM only — there is nothing to `npm install`)
-- A disposable machine you are comfortable running challenge code on
-  (see [Security](#security) below)
+- Node.js ≥ 20 (ESM only — no `npm install`)
+- `git` on `PATH` (for normalized challenge base repos and optional swarm worktrees)
 
 ## Quickstart
 
 ```sh
-node bin/shingun.mjs init-config     # writes config.json + .env.example
-node bin/shingun.mjs serve           # dashboard at the printed URL
+node bin/shingun.mjs init-config     # writes config.json (if absent)
+node bin/shingun.mjs serve           # HTTP JSON API + /mcp on 127.0.0.1:8787
 ```
 
-A first smoke run needs no API keys — the built-in `mock` provider walks a
-fixture challenge to its flag:
+Smoke-test the optional swarm runner offline with the built-in `mock` provider:
 
 ```sh
 node bin/shingun.mjs run test/fixtures/challenge-easy --profile low-power
 ```
 
-To run real models, put a provider key in `.env` (e.g. `MISTRAL_API_KEY=...`)
-and point the roles at that provider in `config.json` — the dashboard's
-settings panel can do both without a restart.
+## Usage (Local + SSH Tunnel)
 
-## CLI
+`shingun serve` binds **`127.0.0.1` only** and rejects non-loopback `Host` headers.
 
-| Command | What it does |
-| --- | --- |
-| `run <repoUrl\|localPath> [--target URL] [--challenge-id ID] [--workers N] [--budget-usd X] [--profile P]` | Full swarm, headless; events stream to stdout as JSONL. `localPath` may be a folder, a `.zip`/`.tar.gz` archive (extracted), or any single file (stored as one artifact). Archive-suffix URLs are downloaded and extracted. `--target` carries a live service URL alongside |
-| `serve [--port N] [--profile P]` | Engine + HTTP API + dashboard on `127.0.0.1` |
-| `status` | Challenges + swarms + workers, from the on-disk event stores |
-| `steer <swarmId> <workerId> <text>` | Steer one worker (queued into its next step) |
-| `init-config` | Write `config.json` + `.env.example` if absent |
+**Local:**
 
-## Dashboard
+```sh
+node bin/shingun.mjs serve --port 8787
+# status: http://127.0.0.1:8787/
+# mcp:    http://127.0.0.1:8787/mcp
+```
 
-A live overview of the node server: hero graph of challenge → master →
-workers, one tile per worker (persona, status, steps/tokens/wall-clock, last
-tool, latest finding) with an inspector drawer (transcript / commands / diff /
-metrics), and a command deck that talks to the master agent.
+**Over SSH (remote CTF box → local agent):**
 
-Actions that mutate the workspace pass a **guard ledger**: depending on the
-guard mode — `instant`, `majors` (default), `all` — proposed actions either
-run immediately or park as pending chips until you confirm them one by one.
-`purge_swarm` always requires a confirm, in every mode.
+On the remote box:
 
-## HTTP API
+```sh
+node bin/shingun.mjs serve --port 8787
+```
 
-All routes are JSON, bound to `127.0.0.1` only, and (when `SHINGUN_TOKEN` is
-set in `.env`) require `Authorization: Bearer <token>`:
+On your workstation:
 
-- `POST /api/v1/challenges` — ingest a git repo URL, a local folder or file, a downloaded archive/file URL (`"source":"download"`), or nothing but a live `target` — a pure live-web challenge (the service URL rides the swarm into every prompt and `TARGET.md`). Archives (`.zip`/`.tar.gz`) are extracted in place — a downloaded picoCTF zip becomes a file tree the recon personas can drill. The same route accepts a raw file upload: send the zip/tar.gz bytes as the body (any non-JSON content type), with `?filename=challenge.zip` (or an `x-shingun-filename` header) and optional `&title=&hint=&target=` query metadata; the response `201` echoes `uploadedBytes`. `"source":"upload"` is what the ingest event records.
-- `POST /api/challenges/:id/swarm` — launch a swarm
-- `GET /api/swarms/:id` — full swarm state, reconstructed by event replay
-- `POST /api/swarms/:id/stop`, `POST .../workers/:wid/message`, `GET .../workers/:wid/diff`, `GET .../bundle`
-- `POST /api/master/message` — directive to the master (swarm-scoped or console-wide)
-- `POST /api/master/confirm {actionId}` — execute one pending action
-- `GET /api/node` — node read-back: console thread tail, pending actions, guard mode, swarm summaries
-- `GET /api/events?swarm=<id>` — SSE stream; backlog replays from event 0, then live
-- `GET|POST /api/providers`, `POST /api/provider-key`, `POST /api/roles` — provider/key management
+```sh
+ssh -L 8787:127.0.0.1:8787 user@box
+```
+
+Point your agent or HTTP client at `http://127.0.0.1:8787` (and MCP Streamable HTTP
+at `http://127.0.0.1:8787/mcp`).
+
+## MCP Integration
+
+`src/mcp.mjs` exposes shingun over **stdio** (`shingun mcp`) and **Streamable HTTP**
+(`POST|GET|DELETE /mcp` on `shingun serve`). Every MCP tool action records events
+into `workspace/challenges/<id>/events/mcp.jsonl` (or `workspace/console/mcp.jsonl`).
+
+### Mount in Vibe
+
+Local stdio:
+
+```sh
+vibe mcp add shingun --transport stdio \
+  --command node \
+  --arg /path/to/shingun/bin/shingun.mjs \
+  --arg mcp
+```
+
+Remote / SSH-tunneled HTTP:
+
+```sh
+vibe mcp add shingun --transport streamable-http --url http://127.0.0.1:8787/mcp
+```
+
+### Mount in Antigravity
+
+Add to `mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "shingun": {
+      "command": "node",
+      "args": ["/path/to/shingun/bin/shingun.mjs", "mcp"]
+    }
+  }
+}
+```
+
+### MCP Tools
+
+| Tool | Arguments | Purpose |
+| --- | --- | --- |
+| `ingest_challenge` | `{url\|path\|bytes?, filename?, title?, hint?, target?, flagFormatRegex?, categoryHint?}` | Ingest git repo, local folder/file, archive URL, base64 zip/tar.gz, or `http(s)://`/`tcp://` target into `challenges/<id>/base` |
+| `tcp_session` | `{action: "connect"\|"send"\|"recv"\|"close", sid?, host?, port?, data?, encoding?, timeoutMs?, challengeId?}` | Persistent bidirectional TCP socket for interactive `nc` services |
+| `read_artifact` | `{challengeId, path, offset?, maxBytes?}` | Path-jailed read inside `challenges/<id>/base` |
+| `search_artifacts` | `{challengeId, pattern, maxHits?}` | Regex search across `challenges/<id>/base` |
+| `submit_flag` | `{challengeId, flag, reasoning?}` | Append `flag.found` to the challenge event store (checked against `flagFormatRegex` if set) |
+| `swarm_run` | `{challengeId, workers?}` | Launch an optional headless worker swarm |
+| `swarm_status` | `{swarmId}` | Read live or replayed swarm status |
+
+## Ingest Contract
+
+- **Sources:**
+  - `url`: git repo URL (`git clone --depth 50`)
+  - `path`: local folder OR single file (`.zip` / `.tar.gz` / `.tgz` extracted; any other file stored as a single artifact)
+  - `download`: HTTP(S) archive/file download (256 MB cap, 120s timeout, CRC-verified zip & USTAR tar.gz with zip-slip guard)
+  - `upload`: raw binary `POST /api/v1/challenges` with non-JSON `Content-Type`; filename from `x-shingun-filename`, `Content-Disposition`, or `?filename=`; metadata (`title`, `hint`, `target`, `targetNote`, `flagFormatRegex`, `categoryHint`) in query params; `201` echoes `uploadedBytes`
+  - `none`: target-only challenge (writes `TARGET.md` into `base/`)
+- **Target:** `{url, note?}` where `url` is `http(s)://...` or `tcp://host:port`. Orthogonal to `source` and written to `TARGET.md`.
+
+## CLI & HTTP API
+
+```sh
+shingun serve [--port N] [--profile P] [--config FILE] [--workspace DIR]
+shingun mcp [--profile P] [--config FILE] [--workspace DIR]
+shingun run <repoUrl|localPath|archiveUrl> [--target URL] [--target-note NOTE] [--challenge-id ID] [--workers N] [--flag-format REGEX] [--category C]
+shingun status [--workspace DIR]
+shingun bundle <swarmId> [--workspace DIR]
+shingun master <swarmId> <directive>
+shingun steer <swarmId> <workerId> <text>
+```
+
+HTTP JSON routes (set `SHINGUN_TOKEN` in `.env` to require `Authorization: Bearer <token>`):
+
+- `GET /` — minimal JSON server status
+- `POST|GET|DELETE /mcp` — MCP Streamable HTTP endpoint
+- `POST /api/v1/challenges` — ingest (JSON or raw binary upload)
+- `GET /api/v1/challenges/:id` — challenge metadata
+- `POST /api/v1/challenges/:id/swarms` — launch optional swarm
+- `GET /api/v1/swarms/:id` — replayed swarm state
+- `DELETE /api/v1/swarms/:id` | `POST /api/v1/swarms/:id/stop` — stop swarm
+- `GET /api/v1/swarms/:id/bundle` — export `.tar.gz` review bundle
+- `POST /api/v1/swarms/:id/workers/:wid/messages`, `GET .../diff`
+- `POST /api/v1/master/messages`, `POST /api/v1/master/confirm`, `GET /api/v1/node`
+- `GET /api/v1/events?swarm=<id>` — SSE event stream
+- `GET /api/v1/providers`, `PUT /api/v1/providers/:provider/key`, `PUT /api/v1/roles`
 
 ## Security
 
-Read this before running it against anything real.
-
-- The server binds `127.0.0.1` only and refuses foreign `Host` headers.
-  Setting `SHINGUN_TOKEN` in `.env` adds a bearer gate (the dashboard shell
-  also accepts `?token=`).
-- Challenge content is untrusted input to an LLM whose output drives a
-  shell. The path jail and command denylist are speed bumps, not
-  containment — run shingun on a disposable machine, not your daily driver.
-- Budget caps (per worker / challenge / swarm) are enforced in code.
-- Values from `.env` are scrubbed from anything sent to a provider;
-  transcripts on disk stay raw. Keys never enter the event store.
-- Flags are never auto-submitted. A human validates and submits them.
-
-## Configuration
-
-`config.json` (see `config.example.json` for the full schema with defaults):
-concurrency caps, worker limits, stall detection, the memory-watermark
-admission gate, budgets, providers, the command denylist, and role →
-provider wiring. The `low-power` profile lowers concurrency for small
-machines. Providers are OpenAI-compatible: an entry with `apiKeyEnv` reads
-its own environment variable, and entries without one share the universal
-`OPENAI_API_KEY` — switching provider is a config change, not an
-environment rename.
-
-## Workspace layout
-
-```
-workspace/challenges/<id>/
-  base/            normalized git repo of the challenge
-  worktrees/       per-worker checkouts
-  scratch/         per-worker private scratch
-  tools/           shared per-challenge tool cache
-  notes.jsonl      shared findings
-  events/          the append-only event store per swarm
-  postmortems/     written at swarm end
-  bundles/         exportable .tar.gz review bundles
-workspace/console/chat.jsonl   the console-wide directive thread
-```
+- Server binds `127.0.0.1` only and refuses non-loopback `Host` headers (`403 host_forbidden`).
+- Challenge inputs and LLM tool calls are untrusted; run on a disposable host when executing challenge binaries or swarms.
+- Optional spend insurance: one invisible per-swarm hard cap (`budget.perSwarmUsd`) enforced in preflight.
+- `.env` secret values are scrubbed before outbound provider calls (`src/scrub.mjs`).
 
 ## Tests
 
 ```sh
-node --test test/
+node --test --test-concurrency=1 "test/*.test.mjs"
 ```
-
-Fully offline: the `mock` provider needs no API keys.
-
-## Design notes
-
-Zero runtime dependencies by choice — copy the folder, install Node, run.
-The event store (append-only JSONL) is the single source of truth; all state
-is reconstructed by deterministic replay, so a crash costs you a restart,
-not your run.
 
 ## License
 
-Apache-2.0 (see [LICENSE](LICENSE)). A personal tool: maintained for its
-author's use, shared as-is.
+Apache-2.0 (see [LICENSE](LICENSE)). A personal tool: maintained for its author's use, shared as-is.

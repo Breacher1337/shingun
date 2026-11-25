@@ -123,36 +123,22 @@ test('acceptance 2a: server boots and gates everything behind the token', async 
 
     const badStatic = await ctx.call('/nope.js');
     assert.equal(badStatic.status, 404);
+    const oldStyle = await ctx.call('/style.css');
+    assert.equal(oldStyle.status, 404, 'dashboard assets removed');
 
-    // The bare 401 entry page offers the tokenized URL form (no data in it).
-    const gate = await fetch(ctx.base + '/');
-    assert.equal(gate.status, 401);
-    assert.match(gate.headers.get('content-type') ?? '', /text\/html/);
-    const gateBody = await gate.text();
-    assert.match(gateBody, /token/i);
-    assert.ok(!gateBody.includes('worker'), 'gate page leaks no swarm data');
+    // Gated root status route also refuses unauthenticated requests as JSON.
+    const unauthRoot = await fetch(ctx.base + '/');
+    assert.equal(unauthRoot.status, 401);
+    assert.match(unauthRoot.headers.get('content-type') ?? '', /application\/json/);
+    await unauthRoot.body.cancel().catch(() => {});
 
-    // Wrong query token still refused.
-    const badQuery = await fetch(`${ctx.base}/?token=nope`);
-    assert.equal(badQuery.status, 401);
-    await badQuery.body.cancel().catch(() => {});
-
-    // Authorized static shell: html + assets with no-store + content types.
-    const html = await ctx.call('/');
-    assert.equal(html.status, 200);
-    assert.match(html.headers.get('content-type') ?? '', /text\/html/);
-    assert.equal(html.headers.get('cache-control'), 'no-store');
-    assert.match(html.text, /dashboard\.mjs/);
-
-    const css = await ctx.call('/style.css');
-    assert.equal(css.status, 200);
-    assert.match(css.headers.get('content-type') ?? '', /text\/css/);
-    assert.equal(css.headers.get('cache-control'), 'no-store');
-
-    const js = await ctx.call('/dashboard.mjs');
-    assert.equal(js.status, 200);
-    assert.match(js.headers.get('content-type') ?? '', /javascript/);
-    assert.equal(js.headers.get('cache-control'), 'no-store');
+    // Authorized minimal JSON status route on GET /.
+    const root = await ctx.call('/');
+    assert.equal(root.status, 200);
+    assert.match(root.headers.get('content-type') ?? '', /application\/json/);
+    assert.equal(root.headers.get('cache-control'), 'no-store');
+    assert.equal(root.body.ok, true);
+    assert.equal(root.body.service, 'shingun');
 
     // Server binds localhost only.
     assert.equal(ctx.srv.server.address().address, '127.0.0.1');
@@ -176,13 +162,12 @@ test('acceptance 2a-2: without SHINGUN_TOKEN the workspace is open — and host-
   try {
     await srv.listen(0);
     assert.equal(srv.gated, false, 'no token in env means open mode');
-    assert.ok(!srv.dashboardUrl.includes('token='), 'no token is minted or printed');
     const base = `http://127.0.0.1:${srv.server.address().port}`;
 
-    // The shell serves bare: no gate page, no token dance.
-    const shell = await fetch(base + '/');
-    assert.equal(shell.status, 200);
-    assert.match(await shell.text(), /dashboard\.mjs/);
+    // Minimal JSON status route answers open.
+    const root = await fetch(base + '/');
+    assert.equal(root.status, 200);
+    assert.equal((await root.json()).service, 'shingun');
 
     // Data routes answer without any Authorization header.
     const providers = await fetch(base + '/api/providers');
@@ -274,8 +259,8 @@ test('acceptance 2b: challenge → swarm visible end-to-end over HTTP + SSE', as
     assert.equal(solved.flags[0].flag, 'shingun{m0ck_fl4g}');
     assert.ok(solved.workers.length >= 1, 'workers are visible');
     assert.ok(solved.workers.every((w) => typeof w.persona === 'string'));
-    assert.ok(solved.budget.usd > 0, 'usage was accumulated');
-    assert.ok(solved.caps.perSwarmUsd > 0, 'caps are exported for meters');
+    assert.equal('budget' in solved, false, 'budget surface removed from swarm API');
+    assert.equal('caps' in solved, false, 'caps surface removed from swarm API');
     assert.ok(solved.lastSeq >= 1, 'replay position is exported');
 
     // The live stream also carries the flag and the final status.
@@ -572,32 +557,30 @@ test('acceptance 2d: `shingun serve` boots the real CLI surface', async () => {
   try {
     let out = '';
     child.stdout.on('data', (d) => { out += d.toString(); });
-    const dashboardUrl = await new Promise((resolve, reject) => {
+    const statusUrl = await new Promise((resolve, reject) => {
       const t0 = Date.now();
       const timer = setInterval(() => {
-        const m = /dashboard: (\S+)/.exec(out);
+        const m = /status: (\S+)/.exec(out);
         if (m) { clearInterval(timer); resolve(m[1]); }
         else if (Date.now() - t0 > 25000) {
           clearInterval(timer);
-          reject(new Error(`serve did not print its dashboard url: ${out.slice(0, 500)}`));
+          reject(new Error(`serve did not print its status url: ${out.slice(0, 500)}`));
         }
       }, 100);
     });
-    assert.match(dashboardUrl, /^http:\/\/127\.0\.0\.1:\d+\/(\?token=\S+)?$/);
+    assert.match(statusUrl, /^http:\/\/127\.0\.0\.1:\d+\/$/);
 
-    const dash = await fetch(dashboardUrl);
-    assert.equal(dash.status, 200);
-    assert.match(await dash.text(), /shingun/);
-
-    // Gated and open serves both pass this smoke; branch on what booted.
-    if (dashboardUrl.includes('token=')) {
-      const gate = await fetch(new URL('/', dashboardUrl));
-      assert.equal(gate.status, 401, 'gated serve refuses the bare shell');
+    const authMode = /auth: (token-gated|open workspace)/.exec(out)?.[1];
+    if (authMode === 'token-gated') {
+      const gate = await fetch(statusUrl);
+      assert.equal(gate.status, 401, 'gated serve refuses bare status');
       await gate.body.cancel().catch(() => {});
     } else {
-      const bare = await fetch(new URL('/', dashboardUrl));
-      assert.equal(bare.status, 200, 'open serve answers the bare shell');
-      const providers = await fetch(new URL('/api/providers', dashboardUrl));
+      const bare = await fetch(statusUrl);
+      assert.equal(bare.status, 200, 'open serve answers minimal JSON status');
+      const statusJson = await bare.json();
+      assert.equal(statusJson.service, 'shingun');
+      const providers = await fetch(new URL('/api/providers', statusUrl));
       assert.equal(providers.status, 200, 'open serve answers data routes without auth');
     }
   } finally {

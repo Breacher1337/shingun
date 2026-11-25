@@ -1,19 +1,21 @@
 import http from 'node:http';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { ingestChallenge } from './ingest.mjs';
+import { ingestChallenge, validateTarget } from './ingest.mjs';
 import { buildBundle } from './bundle.mjs';
 import { createGuardLedger } from './ledger.mjs';
 import { preflightRoleProviders } from './providers/preflight.mjs';
 import { resolveApiKey } from './providers/registry.mjs';
+import { eventSeq, locateSwarm, rebuildSwarmState, replayFile } from './store.mjs';
+import { createMcpServer } from './mcp.mjs';
 import { listTree, nowIso, writeJson } from './util.mjs';
 
 /**
- * Localhost HTTP surface: JSON API + SSE event stream + the dashboard's
- * static shell. The server is a thin skin over the in-process engine:
- * it owns no swarm state of its own — swarm reads are reconstructed by
- * replaying the append-only event store, and swarm writes go straight
- * to the orchestrator.
+ * Localhost HTTP surface: headless JSON API + SSE event stream + minimal
+ * JSON status route (GET /). The server is a thin skin over the in-process
+ * engine: it owns no swarm state of its own — swarm reads are reconstructed
+ * by replaying the append-only event store, and swarm writes go straight to
+ * the orchestrator.
  */
 
 const TERMINAL_STATUSES = ['solved', 'stopped', 'capped'];
@@ -57,24 +59,18 @@ function readJsonBody(req, capBytes = 262144) {
   });
 }
 
-/** Monotonic sequence number from an event id ("<swarmId>-00042"). */
-function eventSeq(event) {
-  const m = /-(\d+)$/.exec(String(event.id ?? ''));
-  return m ? Number(m[1]) : 0;
-}
-
 export async function startServer({
   config,
   env,
   orchestrator,
   bus,
   workspaceDir,
-  webDir,
   envFile = null,
   configFile = null
 }) {
   const challengesDir = path.join(workspaceDir, 'challenges');
   await fs.mkdir(challengesDir, { recursive: true });
+  const mcp = createMcpServer({ orchestrator, bus, workspaceDir });
 
   // Cockpit guard ledger: proposed-but-unconfirmed actions live here, in
   // memory only — a restart clears the queue, exactly like a human would
@@ -154,212 +150,6 @@ export async function startServer({
     return preflightRoleProviders(config, env);
   }
 
-  // -- filesystem helpers ------------------------------------------------
-
-  /** Locate an event store by swarm id, ignoring any in-memory index. */
-  async function locateSwarm(swarmId) {
-    if (!/^[\w-]+$/.test(swarmId)) return null;
-    const entries = await fs.readdir(challengesDir, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const storeFile = path.join(challengesDir, entry.name, 'events', `${swarmId}.jsonl`);
-      const exists = await fs.stat(storeFile).then(() => true).catch(() => false);
-      if (exists) {
-        return {
-          swarmId,
-          challengeId: entry.name,
-          chDir: path.join(challengesDir, entry.name),
-          storeFile
-        };
-      }
-    }
-    return null;
-  }
-
-  async function replay(file) {
-    const text = await fs.readFile(file, 'utf8').catch(() => '');
-    const out = [];
-    for (const line of text.split('\n')) {
-      if (!line.trim()) continue;
-      try { out.push(JSON.parse(line)); } catch { /* skip corrupt tail line */ }
-    }
-    return out;
-  }
-
-  /** Reconstruct the full swarm state by replaying its event store. */
-  function rebuildSwarmState(swarmId, challengeId, events) {
-    const workers = new Map();
-    const worker = (id) => {
-      if (!workers.has(id)) {
-        workers.set(id, {
-          id,
-          persona: '(unknown)',
-          status: 'spawning',
-          steps: 0,
-          tokensIn: 0,
-          tokensOut: 0,
-          seenAt: null,
-          diff: null,
-          tools: [],
-          logs: [],
-          flags: [],
-          stallChecks: 0
-        });
-      }
-      return workers.get(id);
-    };
-    const state = {
-      swarmId,
-      challengeId,
-      status: 'planning',
-      final: false,
-      startedAt: events[0]?.t ?? nowIso(),
-      updatedAt: events[events.length - 1]?.t ?? nowIso(),
-      challenge: { sourceType: null, sourceValue: null, category: null, flagFormat: null },
-      triage: null,
-      flags: [],
-      budget: { usd: 0, tokensIn: 0, tokensOut: 0 },
-      masterChat: [],
-      admission: null,
-      postmortem: null,
-      capNote: null
-    };
-    let lastSeq = 0;
-    for (const ev of events) {
-      lastSeq = Math.max(lastSeq, eventSeq(ev));
-      const w = ev.worker ? worker(ev.worker) : null;
-      switch (ev.type) {
-        case 'challenge.ingested':
-          state.challenge.sourceType = ev.data.sourceType ?? null;
-          state.challenge.sourceValue = ev.data.sourceValue ?? null;
-          break;
-        case 'master.triage':
-          state.triage = ev.data;
-          state.challenge.category = ev.data.category ?? state.challenge.category;
-          state.challenge.flagFormat = ev.data.flagFormat?.regex ?? null;
-          break;
-        case 'worker.spawn':
-          if (w) { w.persona = ev.data.persona ?? w.persona; w.spawnedAt = ev.t; }
-          break;
-        case 'worker.status':
-          if (w) w.status = ev.data.status;
-          break;
-        case 'worker.progress':
-          if (w) {
-            w.steps = ev.data.steps ?? w.steps;
-            w.tokensIn = ev.data.tokensIn ?? w.tokensIn;
-            w.tokensOut = ev.data.tokensOut ?? w.tokensOut;
-            w.seenAt = ev.t;
-          }
-          break;
-        case 'worker.stalled':
-          if (w) w.stallChecks = ev.data.checks ?? w.stallChecks + 1;
-          break;
-        case 'worker.tool':
-          if (w) w.tools.push(ev.data);
-          break;
-        case 'worker.log':
-          if (w) w.logs.push({ seq: ev.data.seq ?? 0, stream: ev.data.stream ?? 'transcript', text: ev.data.text ?? '' });
-          break;
-        case 'worker.diff':
-          if (w) w.diff = ev.data.stats ?? null;
-          break;
-        case 'flag.found':
-          state.flags.push({ workerId: ev.worker, ...ev.data });
-          if (w && !w.flags.includes(ev.data.flag)) w.flags.push(ev.data.flag);
-          break;
-        case 'usage.tick':
-          state.budget.usd += Number(ev.data.costUsd ?? 0) || 0;
-          state.budget.tokensIn += Number(ev.data.tokensIn ?? 0) || 0;
-          state.budget.tokensOut += Number(ev.data.tokensOut ?? 0) || 0;
-          break;
-        case 'budget.capped':
-          state.capNote = ev.data;
-          break;
-        case 'master.chat':
-          state.masterChat.push({ direction: ev.data.direction ?? 'user', text: ev.data.text ?? '', actions: ev.data.actions ?? [], t: ev.t });
-          break;
-        case 'swarm.update':
-          state.status = ev.data.status ?? state.status;
-          if (ev.data.final) state.final = true;
-          break;
-        case 'swarm.stop':
-          state.stoppedBy = ev.data.by ?? null;
-          break;
-        case 'admission.blocked':
-          state.admission = ev.data;
-          break;
-        case 'swarm.postmortem':
-          state.postmortem = ev.data.path ?? null;
-          break;
-        default:
-          break;
-      }
-    }
-    for (const w of workers.values()) {
-      // Keep the replay payload bounded for live dashboards.
-      if (w.logs.length > 240) w.logs = w.logs.slice(-240);
-      if (w.tools.length > 240) w.tools = w.tools.slice(-240);
-    }
-    state.eventCount = events.length;
-    state.lastSeq = lastSeq;
-    state.workers = [...workers.values()];
-    state.caps = {
-      perSwarmUsd: config.budget.perSwarmUsd,
-      perChallengeUsd: config.budget.perChallengeUsd,
-      workerMaxTokens: config.worker.maxTokens,
-      workerMaxSteps: config.worker.maxSteps,
-      workerWallClockMin: config.worker.wallClockMin
-    };
-    state.workerIds = [...workers.keys()];
-    return state;
-  }
-
-  // -- static assets -----------------------------------------------------
-
-  const STATIC_FILES = {
-    '/': { file: 'index.html', type: 'text/html; charset=utf-8' },
-    '/index.html': { file: 'index.html', type: 'text/html; charset=utf-8' },
-    '/dashboard.mjs': { file: 'dashboard.mjs', type: 'text/javascript; charset=utf-8' },
-    '/style.css': { file: 'style.css', type: 'text/css; charset=utf-8' },
-    '/tokens.css': { file: 'tokens.css', type: 'text/css; charset=utf-8' },
-    '/theme-preview.html': { file: 'theme-preview.html', type: 'text/html; charset=utf-8' }
-  };
-
-  async function serveStatic(res, entry) {
-    const body = await fs.readFile(path.join(webDir, entry.file)).catch(() => null);
-    if (body === null) throw httpError('asset_missing', `dashboard asset missing: ${entry.file}`);
-    res.writeHead(200, { 'Content-Type': entry.type, 'Cache-Control': 'no-store' });
-    res.end(body);
-  }
-
-  // A bare 401 that doubles as the operator's entry point: browsers cannot
-  // attach Authorization headers to address-bar navigations, so the page
-  // offers the tokenized URL form. Validation round-trips through an
-  // authorized static request, and a wrong token gets explicit feedback —
-  // no engine data lives in this response.
-  function gatePage(res) {
-    res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-    res.end(`<!doctype html><html><head><meta charset="utf-8"><title>shingun</title>
-<style>body{background:#0b0d10;color:#d7e0e8;font:14px/1.5 ui-monospace,Consolas,monospace;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
-form{background:#11151a;border:1px solid #1d232b;padding:24px;border-radius:8px;width:380px}
-h1{font-size:15px;margin:0 0 6px;letter-spacing:.08em}.hint{color:#7d8a96;margin:0 0 10px;font-size:12px}
-.notkey{color:#ffb454;font-size:11px;margin:0 0 14px;padding:6px 8px;border:1px solid #6b4a26;border-radius:4px;background:rgba(107,74,38,.12)}
-label{display:block;font-size:11px;color:#7d8a96;margin-top:14px}
-input{width:100%;box-sizing:border-box;background:#0b0d10;color:#d7e0e8;border:1px solid #1d232b;border-radius:4px;padding:8px;font:inherit;margin-top:4px}
-button{width:100%;margin-top:14px;padding:8px;border:0;border-radius:4px;background:#2b6cb0;color:#fff;font:inherit;cursor:pointer}
-button:disabled{background:#161b21;color:#4a5560;cursor:wait}
-.error{color:#ff8c42;font-size:12px;margin-top:10px;min-height:16px}
-</style></head><body><form id="gt-form" onsubmit="return false">
-<h1>shingun</h1>
-<p class="hint">This page needs the dashboard <b>access token</b> — not a model provider API key.</p>
-<p class="notkey">Paste the token from the <code>dashboard:</code> URL that <code>shingun serve</code> prints (also in the repo\u2019s <code>.env</code> as <code>SHINGUN_TOKEN</code>).</p>
-<label for="t">access token</label>
-<input id="t" placeholder="SHINGUN_TOKEN" autocomplete="off" autofocus>
-<div class="error" id="e"></div>
-<button id="gt-button" type="button" onclick="(function(){var b=document.getElementById('gt-button');b.disabled=true;var e=document.getElementById('e');e.textContent='';fetch('/style.css',{headers:{Authorization:'Bearer '+document.getElementById('t').value.trim()}}).then(function(r){b.disabled=false;if(r.ok){localStorage.setItem('shingun.token',document.getElementById('t').value.trim());location=location.pathname;}else{e.textContent='token rejected — check SHINGUN_TOKEN in .env';}}).catch(function(){b.disabled=false;e.textContent='could not reach the server — is shingun serve running?';});})()">open dashboard</button></form></body></html>`);
-  }
-
   // -- SSE ---------------------------------------------------------------
 
   async function handleEvents(req, res, swarmId) {
@@ -392,9 +182,9 @@ button:disabled{background:#161b21;color:#4a5560;cursor:wait}
     });
 
     if (swarmId) {
-      const rec = await locateSwarm(swarmId);
+      const rec = await locateSwarm(challengesDir, swarmId);
       if (rec) {
-        for (const ev of await replay(rec.storeFile)) {
+        for (const ev of await replayFile(rec.storeFile)) {
           if (eventSeq(ev) > maxSeqReplayed) maxSeqReplayed = eventSeq(ev);
           send(ev);
         }
@@ -455,20 +245,24 @@ function readRawBody(req, maxBytes) {
     const url = new URL(req.url, `http://127.0.0.1:${config.port}`);
     const pathname = url.pathname;
 
-    // Static shell accepts the token in the query as well: an address-bar
-    // navigation cannot carry headers. Data routes below never do. Without
-    // a configured token the workspace is simply open.
-    const queryToken = url.searchParams.get('token');
-    const staticEntry = STATIC_FILES[pathname];
-    if (staticEntry) {
-      if (authorize(req) || (gated && queryToken && queryToken === token)) return serveStatic(res, staticEntry);
-      return gatePage(res);
-    }
-
     if (!authorize(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ error: { code: 'unauthorized', message: 'missing or invalid bearer token' } }));
       return;
+    }
+
+    if (req.method === 'GET' && pathname === '/') {
+      return sendJson(res, 200, {
+        ok: true,
+        service: 'shingun',
+        status: 'ok',
+        gated,
+        swarms: { live: orchestrator.swarms.size }
+      });
+    }
+
+    if (pathname === '/mcp') {
+      return mcp.handleHttp(req, res);
     }
 
     if (pathname === '/api/events' || pathname === '/api/v1/events') {
@@ -526,7 +320,7 @@ function readRawBody(req, maxBytes) {
         throw httpError('bad_request', 'apiKey must be at least 8 characters with no whitespace');
       }
       if (/:\/\//.test(key)) {
-        throw httpError('bad_request', 'apiKey looks like a web address — that is the dashboard URL, not a model provider key. Paste the API key issued by the provider console (for mistral: console.mistral.ai → API keys).');
+        throw httpError('bad_request', 'apiKey looks like a web address — that is the server URL, not a model provider key. Paste the API key issued by the provider console.');
       }
       // Live: the env object is shared with the orchestrator and providers
       // are built per spawn, so the key applies without a restart.
@@ -619,18 +413,15 @@ function readRawBody(req, maxBytes) {
       } else {
         body = await readJsonBody(req);
       }
-      const target = body.target === undefined || body.target === null ? null : body.target;
-      if (target !== null && (typeof target !== 'object' || !/^https?:\/\/.+/i.test(String(target.url ?? '').trim()))) {
-        throw httpError('bad_request', 'target must be {url, note?} with an http(s) url — the live service the challenge runs at');
-      }
+      const safeTarget = validateTarget(body.target ?? null);
       const allowedSources = ['url', 'path', 'download', 'upload', 'none'];
-      if (target && body.source === undefined) {
-        // A pure live-web challenge: no files, the target is the challenge.
+      if (safeTarget && body.source === undefined) {
+        // A pure live-web/tcp challenge: no files, the target is the challenge.
         body.source = 'none';
         body.value = '';
       }
       if (!allowedSources.includes(body.source)) {
-        throw httpError('bad_request', 'source must be "url" (git), "path" (local folder), "download" (archive URL), or "upload" (raw file body) — or omit it and pass a target');
+        throw httpError('bad_request', 'source must be "url" (git), "path" (local folder/file), "download" (archive URL), or "upload" (raw file body) — or omit it and pass a target');
       }
       if (body.source !== 'none' && body.source !== 'upload' && (typeof body.value !== 'string' || !body.value.trim())) {
         throw httpError('bad_request', 'value must be a non-empty string');
@@ -640,7 +431,7 @@ function readRawBody(req, maxBytes) {
         source: body.source,
         value: body.source === 'none' ? '' : body.source === 'upload' ? body.value : body.value.trim(),
         challengesDir,
-        target: target ?? null,
+        target: safeTarget,
         maxBytes: typeof body.maxBytes === 'number' && Number.isFinite(body.maxBytes) && body.maxBytes > 0
           ? Math.min(body.maxBytes, 1024 * 1024 * 1024) : undefined
       });
@@ -739,9 +530,9 @@ function readRawBody(req, maxBytes) {
       if (!swarmId) throw httpError('not_found', `no route for ${req.method} ${pathname}`);
 
       if (req.method === 'GET' && segments.length === 2) {
-        const rec = await locateSwarm(swarmId);
+        const rec = await locateSwarm(challengesDir, swarmId);
         if (!rec) throw httpError('swarm_unknown', `unknown swarm ${swarmId}`);
-        const state = rebuildSwarmState(rec.swarmId, rec.challengeId, await replay(rec.storeFile));
+        const state = rebuildSwarmState(rec.swarmId, rec.challengeId, await replayFile(rec.storeFile));
         return sendJson(res, 200, state);
       }
 
@@ -750,9 +541,9 @@ function readRawBody(req, maxBytes) {
       if (isDeleteStop || isPostStop) {
         const live = orchestrator.swarms.get(swarmId);
         if (!live) {
-          const rec = await locateSwarm(swarmId);
+          const rec = await locateSwarm(challengesDir, swarmId);
           if (!rec) throw httpError('swarm_unknown', `unknown swarm ${swarmId}`);
-          const state = rebuildSwarmState(rec.swarmId, rec.challengeId, await replay(rec.storeFile));
+          const state = rebuildSwarmState(rec.swarmId, rec.challengeId, await replayFile(rec.storeFile));
           if (state.final || TERMINAL_STATUSES.includes(state.status)) {
             return sendJson(res, 200, { stopped: true, already: 'terminal' });
           }
@@ -790,9 +581,9 @@ function readRawBody(req, maxBytes) {
       }
 
       if (req.method === 'GET' && segments.length === 5 && segments[2] === 'workers' && segments[4] === 'diff') {
-        const rec = await locateSwarm(swarmId);
+        const rec = await locateSwarm(challengesDir, swarmId);
         if (!rec) throw httpError('swarm_unknown', `unknown swarm ${swarmId}`);
-        const events = await replay(rec.storeFile);
+        const events = await replayFile(rec.storeFile);
         const lastDiff = [...events].reverse().find((e) => e.type === 'worker.diff' && e.worker === segments[3]);
         const diffText = await fs.readFile(path.join(rec.chDir, 'diffs', `${segments[3]}.diff`), 'utf8').catch(() => null);
         if (diffText === null && !lastDiff) {
@@ -876,8 +667,8 @@ function readRawBody(req, maxBytes) {
         if (!entry.isDirectory()) continue;
         const evDir = path.join(challengesDir, entry.name, 'events');
         const files = await fs.readdir(evDir).catch(() => []);
-        for (const f of files.filter((x) => x.endsWith('.jsonl'))) {
-          const events = await replay(path.join(evDir, f));
+        for (const f of files.filter((x) => x.endsWith('.jsonl') && x !== 'mcp.jsonl')) {
+          const events = await replayFile(path.join(evDir, f));
           if (!events.length) continue;
           const lastUpdate = [...events].reverse().find((e) => e.type === 'swarm.update');
           swarms.push({
@@ -941,6 +732,7 @@ function readRawBody(req, maxBytes) {
   });
 
   const close = () => new Promise((resolve) => {
+    mcp.closeAll();
     server.close(() => resolve());
     // SSE connections never end on their own; drop them so close settles.
     server.closeIdleConnections?.();
@@ -952,7 +744,6 @@ function readRawBody(req, maxBytes) {
     token,
     gated,
     get url() { return `http://127.0.0.1:${config.port}/`; },
-    get dashboardUrl() { return gated ? `http://127.0.0.1:${config.port}/?token=${token}` : `http://127.0.0.1:${config.port}/`; },
     listen,
     close
   };

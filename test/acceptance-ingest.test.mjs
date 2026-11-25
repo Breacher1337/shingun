@@ -239,6 +239,14 @@ test('api: POST /api/v1/challenges accepts a pure live-web target challenge', as
       method: 'POST', body: { target: { url: 'not-a-url' } }
     });
     assert.equal(bad.status, 400);
+
+    const tcpMade = await call('/api/v1/challenges', {
+      method: 'POST',
+      body: { title: 'Secure Printer', target: { url: 'tcp://127.0.0.1:10071', note: 'nc service' } }
+    });
+    assert.equal(tcpMade.status, 201, 'API accepts tcp:// target without http-ism regression');
+    const tcpMeta = await call(`/api/v1/challenges/${tcpMade.body.challengeId}`);
+    assert.equal(tcpMeta.body.target.url, 'tcp://127.0.0.1:10071');
   } finally {
     await srv.close();
     fs.rm(wr, { recursive: true, force: true }).catch(() => {});

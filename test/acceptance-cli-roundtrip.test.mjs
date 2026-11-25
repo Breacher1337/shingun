@@ -36,7 +36,7 @@ async function bootServe(ws, port, configFile) {
   const url = await new Promise((resolve, reject) => {
     const t0 = Date.now();
     const timer = setInterval(() => {
-      const m = /dashboard: (\S+)/.exec(out);
+      const m = /serving on (\S+)/.exec(out);
       if (m) { clearInterval(timer); resolve(m[1]); }
       else if (Date.now() - t0 > 25000) {
         clearInterval(timer);
@@ -44,7 +44,8 @@ async function bootServe(ws, port, configFile) {
       }
     }, 100);
   });
-  const token = new URL(url).searchParams.get('token');
+  const envText = await fs.readFile(path.join(ROOT, '.env'), 'utf8').catch(() => '');
+  const token = /^SHINGUN_TOKEN=(.+)$/m.exec(envText)?.[1]?.trim().replace(/^["']|["']$/g, '') ?? null;
   return { child, base: new URL(url).origin, token, url };
 }
 
@@ -52,7 +53,7 @@ async function api(base, token, routePath, { method = 'GET', body } = {}) {
   const res = await fetch(base + routePath, {
     method,
     headers: {
-      Authorization: `Bearer ${token}`,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(body !== undefined ? { 'Content-Type': 'application/json' } : {})
     },
     body: body !== undefined ? JSON.stringify(body) : undefined

@@ -7,7 +7,9 @@ import path from 'node:path';
  * File tools and shell cwd both go through this.
  */
 export async function makeJail(roots) {
-  const allowed = roots.filter(Boolean).map((r) => path.resolve(r));
+  const allowed = await Promise.all(
+    roots.filter(Boolean).map((r) => fs.realpath(r).catch(() => path.resolve(r)))
+  );
   return {
     roots: allowed,
     async check(p) {

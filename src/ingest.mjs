@@ -46,7 +46,7 @@ function nameFromUrl(url) {
   }
 }
 
-function validateTarget(target) {
+export function validateTarget(target) {
   if (target === null || target === undefined) return null;
   if (typeof target !== 'object') throw httpError('bad_request', 'target must be {url, note?}');
   const url = String(target.url ?? '').trim();
@@ -246,6 +246,7 @@ async function normalizeRepo(baseDir) {
 }
 
 export function targetMarkdown(target) {
+  const isTcp = /^tcp:\/\//i.test(String(target?.url ?? ''));
   return [
     '# Live target',
     '',
@@ -255,7 +256,9 @@ export function targetMarkdown(target) {
     '',
     target.note ? `Operator note: ${target.note}` : '',
     'The service is reachable over the network and is part of the',
-    'challenge; attack it over HTTP. The host around it is out of scope.'
+    isTcp
+      ? 'challenge; connect to it over raw TCP (e.g. tcp_session / nc). The host around it is out of scope.'
+      : 'challenge; attack it over HTTP. The host around it is out of scope.'
   ].filter(Boolean).join('\n') + '\n';
 }
 

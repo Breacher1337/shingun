@@ -4,7 +4,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { runCli, tmpWorkspace, FIXTURE } from './helpers.mjs';
 import { getProvider } from '../src/providers/registry.mjs';
-import { createBudgetGuard } from '../src/budget.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const LANES_CONFIG = path.join(ROOT, 'test', 'fixtures', 'test-config-lanes.json');
@@ -63,18 +62,4 @@ test('model lane: rider personas ride the lane, everyone else rides the worker r
   const flag = events.find((e) => e.type === 'flag.found');
   assert.ok(flag, 'flag.found unaffected by the lane');
   fs.rm(ws, { recursive: true, force: true }).catch(() => {});
-});
-
-test('model lane: the lane gets its own budget ledger line', () => {
-  const guard = createBudgetGuard();
-  guard.addScope('worker:w1', { tokenCap: 1000 });
-  guard.addScope('lane:coder');
-  const pre = guard.preflight({ scopeIds: ['worker:w1', 'lane:coder'], estTokens: 500, priceIn: 0.7, priceOut: 2.1 });
-  assert.equal(pre.ok, true, 'lane scope never tightens caps alone');
-  const rec = guard.record({ scopeIds: ['worker:w1', 'lane:coder'], tokensIn: 100, tokensOut: 20, priceIn: 0.7, priceOut: 2.1 });
-  const snap = guard.snapshot();
-  assert.ok(snap['lane:coder'], 'lane ledger line exists');
-  assert.equal(snap['lane:coder'].tokens, 120, 'lane line accumulates reconciled usage');
-  assert.ok(snap['lane:coder'].usd > 0, 'lane line prices its spend');
-  assert.equal(rec.usd > 0, true, 'reconcile prices the call');
 });

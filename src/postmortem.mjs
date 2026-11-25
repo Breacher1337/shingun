@@ -32,7 +32,6 @@ export function renderPostmortem({ swarm, challenge, events, workers, flags, dea
     '- **Challenge**: ' + challenge.id + ' (' + (challenge.sourceType ?? '?') + ': ' + (challenge.sourceValue ?? '?') + ')',
     '- **Category**: ' + (challenge.category ?? 'unknown') + ' · **Flag format**: ' + (challenge.flagFormat ?? 'unknown') + ' (' + (challenge.flagFormatSource ?? 'unknown') + ')',
     '- **Status**: ' + swarm.status + (swarm.solvedBy ? ' · solved by ' + swarm.solvedBy : ''),
-    '- **Budget**: ' + (swarm.spentTokens ?? 0) + ' tokens · $' + (swarm.spentUsd ?? 0).toFixed(4),
     '',
     '## Flags',
     '',

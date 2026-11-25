@@ -125,7 +125,7 @@ test('acceptance 3a-3: `shingun status` reads swarm state off disk', async () =>
     assert.equal(mine.final, true);
     assert.deepEqual(mine.flags, ['shingun{m0ck_fl4g}']);
     assert.ok(mine.workers.length >= 1, 'workers summarized');
-    assert.ok(mine.spentUsd > 0, 'usage cost digested');
+    assert.equal('spentUsd' in mine, false, 'budget surface removed from status');
   } finally {
     fs.rm(ws, { recursive: true, force: true }).catch(() => {});
   }
