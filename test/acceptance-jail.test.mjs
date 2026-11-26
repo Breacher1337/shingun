@@ -76,5 +76,20 @@ test('acceptance 3c: tool layer refuses jailed writes and reports cleanly', asyn
 
   const denied = await executeTool({ name: 'run_shell', args: { command: 'cat /etc/shadow' }, ctx });
   assert.equal(denied.exitCode, 126);
+
+  // P3-3: output between outputCap/2 and outputCap is NOT falsely marked truncated
+  const halfPlus = await runner.run('node -e "process.stdout.write(\'x\'.repeat(60))"', { cwd: wt, outputCap: 100 });
+  assert.equal(halfPlus.truncated, false);
+  const overCap = await runner.run('node -e "process.stdout.write(\'x\'.repeat(120))"', { cwd: wt, outputCap: 100 });
+  assert.equal(overCap.truncated, true);
+
+  // P1-7b: workertools read_file offset/limit on larger multi-line file
+  const lines = Array.from({ length: 200 }, (_, i) => `line-${i}: ${'a'.repeat(40)}`).join('\n');
+  await fs.writeFile(path.join(wt, 'many.txt'), lines, 'utf8');
+  const slice = await executeTool({ name: 'read_file', args: { path: 'many.txt', offset: 150, limit: 3 }, ctx });
+  assert.match(slice.text, /^line-150:/);
+  assert.match(slice.text, /line-152:/);
+  assert.doesNotMatch(slice.text, /line-153:/);
+
   fs.rm(base, { recursive: true, force: true }).catch(() => {});
 });

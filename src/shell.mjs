@@ -98,16 +98,16 @@ function runProcess(cmd, args, { cwd, timeoutSec, outputCap, detached }) {
     };
 
     child.stdout.on('data', (d) => {
+      if (out.length + d.length > outputCap) truncated = true;
       if (out.length < outputCap) {
         out = Buffer.concat([out, d.subarray(0, outputCap - out.length)]);
       }
-      if (out.length + d.length > outputCap) truncated = true;
     });
     child.stderr.on('data', (d) => {
+      if (err.length + d.length > outputCap) truncated = true;
       if (err.length < outputCap) {
         err = Buffer.concat([err, d.subarray(0, outputCap - err.length)]);
       }
-      if (err.length + d.length > outputCap) truncated = true;
     });
 
     const timer = setTimeout(() => {

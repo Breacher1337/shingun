@@ -37,7 +37,14 @@ export async function captureDiff(worktreePath, { outputCap = 65536 } = {}) {
 }
 
 export async function removeWorktree(worktreePath) {
-  await execDirect('git', ['worktree', 'remove', '--force', worktreePath], {
-    cwd: path.dirname(path.dirname(worktreePath)), timeoutSec: 30, outputCap: 2048
-  }).catch(() => {});
+  try {
+    const res = await execDirect('git', ['worktree', 'remove', '--force', worktreePath], {
+      cwd: path.dirname(path.dirname(worktreePath)), timeoutSec: 30, outputCap: 2048
+    });
+    if (res.exitCode !== 0) {
+      process.stderr.write(`[worktree] failed to remove ${worktreePath}: ${res.stderr.trim()}\n`);
+    }
+  } catch (e) {
+    process.stderr.write(`[worktree] failed to remove ${worktreePath}: ${e.message}\n`);
+  }
 }

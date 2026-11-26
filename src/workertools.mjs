@@ -97,15 +97,60 @@ export async function executeTool({ name, args, ctx }) {
       case 'read_file': {
         const j = await ctx.jail.check(targetIn(ctx, args.path));
         if (!j.ok) return { error: 'path_jail', path: args.path };
-        let text;
-        try { text = await fs.readFile(j.resolved, 'utf8'); } catch (e) {
-          return { error: 'read_failed', message: e.message };
-        }
-        const lines = text.split('\n');
         const offset = Math.max(0, Number(args.offset) || 0);
-        const limit = Math.max(1, Number(args.limit) || lines.length);
-        const sliced = lines.slice(offset, offset + limit).join('\n');
-        return { path: j.resolved, ...truncateBytes(sliced, ctx.config.worker.commandOutputCap) };
+        const limit = args.limit !== undefined ? Math.max(1, Number(args.limit) || 1) : Infinity;
+        const capBytes = ctx.config.worker.commandOutputCap;
+        const windowCap = capBytes + 256;
+        let fh;
+        try {
+          fh = await fs.open(j.resolved, 'r');
+          const chunk = Buffer.allocUnsafe(32768);
+          let lineIdx = 0;
+          let collected = [];
+          let collectedBytes = 0;
+          let collectedLines = 0;
+          let pos = 0;
+          let carry = Buffer.alloc(0);
+          let done = false;
+          while (!done) {
+            const { bytesRead } = await fh.read(chunk, 0, chunk.length, pos);
+            if (bytesRead === 0) break;
+            pos += bytesRead;
+            const buf = carry.length ? Buffer.concat([carry, chunk.subarray(0, bytesRead)]) : chunk.subarray(0, bytesRead);
+            let start = 0;
+            for (let i = 0; i < buf.length; i++) {
+              if (buf[i] === 0x0a) {
+                if (lineIdx >= offset) {
+                  const lineBuf = buf.subarray(start, i);
+                  if (collectedLines > 0) {
+                    collected.push(Buffer.from('\n'));
+                    collectedBytes += 1;
+                  }
+                  collected.push(Buffer.from(lineBuf));
+                  collectedBytes += lineBuf.length;
+                  collectedLines += 1;
+                  if (collectedLines >= limit || collectedBytes >= windowCap) {
+                    done = true;
+                    break;
+                  }
+                }
+                lineIdx += 1;
+                start = i + 1;
+              }
+            }
+            carry = done ? Buffer.alloc(0) : Buffer.from(buf.subarray(start));
+          }
+          if (!done && carry.length && lineIdx >= offset && collectedLines < limit && collectedBytes < windowCap) {
+            if (collectedLines > 0) collected.push(Buffer.from('\n'));
+            collected.push(carry);
+          }
+          const sliced = Buffer.concat(collected).toString('utf8');
+          return { path: j.resolved, ...truncateBytes(sliced, capBytes) };
+        } catch (e) {
+          return { error: 'read_failed', message: e.message };
+        } finally {
+          await fh?.close().catch(() => {});
+        }
       }
       case 'write_file': {
         const j = await ctx.jail.check(targetIn(ctx, args.path));

@@ -175,7 +175,7 @@ async function materializeVariant({ runDirs, baseConfig, variant }) {
  * One (variant × challenge) run: spawn `shingun run`, tee its JSONL event
  * stream to disk, reduce it, enforce the wall-clock timeout.
  */
-function runOnce({ shingunCli, configPath, workspace, challenge, variant, eventsFile }) {  return new Promise((resolve) => {
+function runOnce({ shingunCli, configPath, workspace, challenge, variant, eventsFile, timeoutMs: derivedTimeoutMs }) {  return new Promise((resolve) => {
     const startMs = Date.now();
     const cliArgs = [
       shingunCli, 'run', challenge.path,
@@ -212,7 +212,7 @@ function runOnce({ shingunCli, configPath, workspace, challenge, variant, events
       resolve(record);
     };
 
-    const timeoutMs = variant.timeoutMs ?? 20 * 60_000;
+    const timeoutMs = variant.timeoutMs ?? derivedTimeoutMs ?? 20 * 60_000;
     const timer = setTimeout(() => {
       record.timeout = true;
       child.kill('SIGTERM');
@@ -288,7 +288,7 @@ function summarize(records) {
       meanCostUsd: mean(rs.map((r) => r.costUsd)),
       costPerSolvedUsd: solved.length ? solved.reduce((a, r) => a + r.costUsd, 0) / solved.length : null,
       meanWallSec: mean(wall),
-      p50FlagSec: pct.length ? pct[Math.floor(pct.length / 2)] : null,
+      p50FlagSec: pct.length ? pct[Math.floor((pct.length - 1) / 2)] : null,
       meanSteps: mean(rs.map((r) => r.steps))
     });
   }
@@ -358,11 +358,11 @@ async function main() {
 
       // Fresh workspace per run → zero state bleed between A/B.
       const workspace = path.join(runDirs, 'ws', sanitize(challenge.id));
-      const { configPath } = await materializeVariant({ runDirs, baseConfig, variant });
+      const { configPath, timeoutMs } = await materializeVariant({ runDirs, baseConfig, variant });
       await fs.rm(workspace, { recursive: true, force: true });
 
       process.stdout.write(`▶ ${variant.name} / ${challenge.id}\n`);
-      const record = await runOnce({ shingunCli: CLI, configPath, workspace, challenge, variant, eventsFile });
+      const record = await runOnce({ shingunCli: CLI, configPath, workspace, challenge, variant, eventsFile, timeoutMs });
       record.eventsFile = eventsFile;
       records.push(record);
       process.stdout.write(`  ${record.solved ? '✔ solved' : '✘ unsolved'} (${record.finalStatus ?? '—'}) ` +

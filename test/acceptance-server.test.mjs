@@ -3,6 +3,7 @@ import assert from 'node:assert';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { loadConfig, resolveWorkspace } from '../src/config.mjs';
@@ -11,7 +12,7 @@ import { createOrchestrator } from '../src/orchestrator.mjs';
 import { startServer } from '../src/server.mjs';
 import { tmpWorkspace, NODE, BIN } from './helpers.mjs';
 
-const ROOT = path.resolve(import.meta.dirname, '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CHALLENGE = path.join(ROOT, 'test', 'fixtures', 'challenge-easy');
 const TEST_CONFIG = path.join(ROOT, 'test', 'fixtures', 'test-config.json');
 const TOKEN = 't-' + 'a'.repeat(40);
@@ -588,5 +589,115 @@ test('acceptance 2d: `shingun serve` boots the real CLI surface', async () => {
     child.stdout.destroy?.();
     child.stderr.destroy?.();
     fs.rm(ws, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('P0-1: HTTP API rejects path-traversal ids with 400 bad_request and admits valid ids', async () => {
+  const ctx = await boot();
+  try {
+    for (const badId of ['..%2F..%2F', '..%2Fetc', 'a%20b', 'bad$id']) {
+      const g = await ctx.call(`/api/v1/challenges/${badId}`);
+      assert.equal(g.status, 400, `GET challenges/${badId} must 400`);
+      assert.equal(g.body.error.code, 'bad_request');
+
+      const p = await ctx.call(`/api/v1/challenges/${badId}/swarms`, { method: 'POST', body: {} });
+      assert.equal(p.status, 400, `POST challenges/${badId}/swarms must 400`);
+      assert.equal(p.body.error.code, 'bad_request');
+
+      const sw = await ctx.call(`/api/v1/swarms/${badId}`);
+      assert.equal(sw.status, 400, `GET swarms/${badId} must 400`);
+      assert.equal(sw.body.error.code, 'bad_request');
+    }
+
+    const ch = await ctx.call('/api/v1/challenges', { method: 'POST', body: { source: 'path', value: CHALLENGE } });
+    assert.equal(ch.status, 201);
+    const okMeta = await ctx.call(`/api/v1/challenges/${ch.body.challengeId}`);
+    assert.equal(okMeta.status, 200);
+    assert.equal(okMeta.body.challengeId, ch.body.challengeId);
+  } finally {
+    await teardown(ctx, null);
+  }
+});
+
+test('P1-4: Origin validation rejects foreign Origin with 403 origin_forbidden and allows loopback/absent', async () => {
+  const ctx = await boot();
+  try {
+    for (const badOrigin of ['https://evil.com', 'http://evil.com:8787', 'null', 'http://127.0.0.1.evil.com']) {
+      const r1 = await fetch(`${ctx.base}/mcp`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${TOKEN}`, Origin: badOrigin, 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' })
+      });
+      assert.equal(r1.status, 403, `POST /mcp with Origin ${badOrigin} must 403`);
+      assert.equal((await r1.json()).error.code, 'origin_forbidden');
+
+      const r2 = await fetch(`${ctx.base}/api/v1/challenges`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${TOKEN}`, Origin: badOrigin, 'content-type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      assert.equal(r2.status, 403, `POST /api/v1/challenges with Origin ${badOrigin} must 403`);
+      assert.equal((await r2.json()).error.code, 'origin_forbidden');
+    }
+
+    for (const goodOrigin of ['http://127.0.0.1:8787', 'http://localhost:3000', 'http://[::1]:8787', 'http://localhost']) {
+      const ok = await fetch(`${ctx.base}/mcp`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${TOKEN}`, Origin: goodOrigin, 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' })
+      });
+      assert.equal(ok.status, 200, `POST /mcp with Origin ${goodOrigin} must 200`);
+    }
+  } finally {
+    await teardown(ctx, null);
+  }
+});
+
+test('P2-1 & P2-3: oversized Content-Length and streamed body return 413 JSON, and GET /api/v1/node caches summaries', async () => {
+  const ctx = await boot();
+  const net = await import('node:net');
+  try {
+    // Content-Length > 256 KiB -> 413 JSON reaches client
+    const bigJson = JSON.stringify({ pad: 'a'.repeat(300 * 1024) });
+    const clRes = await fetch(`${ctx.base}/api/v1/challenges`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+      body: bigJson
+    });
+    assert.equal(clRes.status, 413);
+    assert.equal((await clRes.json()).error.code, 'payload_too_large');
+
+    // Streamed chunked body without Content-Length > 256 KiB -> 413 JSON reaches client
+    const port = ctx.srv.server.address().port;
+    const streamedStatus = await new Promise((resolve, reject) => {
+      const sock = net.createConnection({ host: '127.0.0.1', port }, () => {
+        sock.write(
+          `POST /api/v1/challenges HTTP/1.1\r\n` +
+          `Host: 127.0.0.1:${port}\r\n` +
+          `Authorization: Bearer ${TOKEN}\r\n` +
+          `Content-Type: application/json\r\n` +
+          `Transfer-Encoding: chunked\r\n\r\n`
+        );
+        const chunk = Buffer.from('{"pad":"' + 'b'.repeat(300 * 1024) + '"}');
+        sock.write(`${chunk.length.toString(16)}\r\n`);
+        sock.write(chunk);
+        sock.write(`\r\n0\r\n\r\n`);
+      });
+      let raw = '';
+      sock.on('data', (d) => { raw += d.toString('utf8'); });
+      sock.on('end', () => resolve(raw));
+      sock.on('close', () => resolve(raw));
+      sock.on('error', reject);
+    });
+    assert.match(streamedStatus, /^HTTP\/1\.1 413 /);
+    assert.match(streamedStatus, /"code":"payload_too_large"/);
+
+    // P2-3: GET /api/v1/node twice returns identical cached summary
+    const n1 = await ctx.call('/api/v1/node');
+    const n2 = await ctx.call('/api/v1/node');
+    assert.equal(n1.status, 200);
+    assert.deepEqual(n1.body.swarms, n2.body.swarms);
+  } finally {
+    await teardown(ctx, null);
   }
 });

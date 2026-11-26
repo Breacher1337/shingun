@@ -2,9 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { runCli, tmpWorkspace, FIXTURE } from './helpers.mjs';
 
-const TEST_CONFIG = path.join(path.resolve(import.meta.dirname, '..'), 'test', 'fixtures', 'test-config.json');
+const TEST_CONFIG = path.join(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'), 'test', 'fixtures', 'test-config.json');
 
 test('acceptance 1: mock swarm solves the fixture repo end to end', async () => {
   const ws = await tmpWorkspace('happy');

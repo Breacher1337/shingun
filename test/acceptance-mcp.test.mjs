@@ -3,6 +3,7 @@ import assert from 'node:assert';
 import fs from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { buildZip } from './fixtures/zip-fixture.mjs';
 import { loadConfig, resolveWorkspace } from '../src/config.mjs';
@@ -12,7 +13,7 @@ import { startServer } from '../src/server.mjs';
 import { replayFile } from '../src/store.mjs';
 import { tmpWorkspace, NODE, BIN } from './helpers.mjs';
 
-const ROOT = path.resolve(import.meta.dirname, '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TEST_CONFIG = path.join(ROOT, 'test', 'fixtures', 'test-config.json');
 
 /** Start a local silent/menu TCP challenge server for tcp_session tests. */
@@ -212,6 +213,200 @@ test('mcp streamable-http: /mcp works over localhost HTTP and respects token + h
   } finally {
     for (const [id] of orch.swarms) await orch.stop(id, 'test-teardown').catch(() => {});
     await srv.close();
+    fs.rm(ws, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('P0-2: tcp_session rejects traversal challengeId and still works when absent', async () => {
+  const ws = await tmpWorkspace('mcp-p0-2-');
+  const tcp = await startMockTcpChallenge();
+  const { config, env } = await loadConfig({ file: TEST_CONFIG, profile: 'low-power', envFile: path.join(ws, '.env') });
+  const bus = createBus();
+  const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, ws), env, bus });
+  const srv = await startServer({ config, env, orchestrator: orch, bus, workspaceDir: ws });
+  await srv.listen(0);
+  const base = `http://127.0.0.1:${srv.server.address().port}`;
+  const postMcp = async (msg) => {
+    const res = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(msg)
+    });
+    return { status: res.status, body: await res.json() };
+  };
+
+  try {
+    const bad = await postMcp({
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: {
+        name: 'tcp_session',
+        arguments: { action: 'connect', host: '127.0.0.1', port: tcp.port, challengeId: '../../escaped' }
+      }
+    });
+    assert.equal(bad.body.result.isError, true);
+    assert.match(bad.body.result.content[0].text, /challengeId must be a valid challenge id/);
+    const escapedPath = path.join(ws, 'escaped', 'events', 'mcp.jsonl');
+    assert.equal(await fs.stat(escapedPath).then(() => true).catch(() => false), false);
+
+    // Absent challengeId lands in console/mcp.jsonl
+    const ok = await postMcp({
+      jsonrpc: '2.0', id: 2, method: 'tools/call',
+      params: { name: 'tcp_session', arguments: { action: 'connect', host: '127.0.0.1', port: tcp.port } }
+    });
+    assert.equal(ok.body.result.isError ?? false, false);
+    const data = JSON.parse(ok.body.result.content[0].text);
+    assert.equal(data.connected, true);
+    const consoleMcp = await replayFile(path.join(ws, 'console', 'mcp.jsonl'));
+    assert.ok(consoleMcp.some((e) => e.type === 'mcp.tcp' && e.data.sid === data.sid));
+  } finally {
+    await srv.close();
+    tcp.srv.close();
+    fs.rm(ws, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('P1-1..P1-3: MCP version negotiation fallback, Mcp-Session-Id only on initialize, and -32602 for unknown tool', async () => {
+  const ws = await tmpWorkspace('mcp-p1-');
+  const { config, env } = await loadConfig({ file: TEST_CONFIG, profile: 'low-power', envFile: path.join(ws, '.env') });
+  const bus = createBus();
+  const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, ws), env, bus });
+  const srv = await startServer({ config, env, orchestrator: orch, bus, workspaceDir: ws });
+  await srv.listen(0);
+  const base = `http://127.0.0.1:${srv.server.address().port}`;
+  const postMcp = async (msg) => {
+    const res = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(msg)
+    });
+    return { status: res.status, headers: res.headers, body: res.status === 202 ? null : await res.json() };
+  };
+
+  try {
+    // P1-1: unsupported protocolVersion falls back to newest ('2025-06-18')
+    // P1-2: initialize returns Mcp-Session-Id
+    const init = await postMcp({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '1999-01-01' } });
+    assert.equal(init.status, 200);
+    assert.equal(init.body.result.protocolVersion, '2025-06-18');
+    assert.ok(init.headers.get('mcp-session-id'), 'initialize assigns Mcp-Session-Id');
+
+    // P1-2: subsequent calls & notifications do NOT return Mcp-Session-Id
+    const list = await postMcp({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+    assert.equal(list.headers.get('mcp-session-id'), null, 'tools/list omits Mcp-Session-Id');
+    const notif = await postMcp({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    assert.equal(notif.status, 202);
+    assert.equal(notif.headers.get('mcp-session-id'), null, '202 omits Mcp-Session-Id');
+
+    // P1-3: unknown tool returns JSON-RPC -32602 "Unknown tool: <name>"
+    const unk = await postMcp({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'no_such_tool', arguments: {} } });
+    assert.equal(unk.body.error.code, -32602);
+    assert.equal(unk.body.error.message, 'Unknown tool: no_such_tool');
+  } finally {
+    await srv.close();
+    fs.rm(ws, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('P1-7: read_artifact reads ranged slices of >10 MiB file and rejects over mcp.maxFileBytes', async () => {
+  const ws = await tmpWorkspace('mcp-p1-7-');
+  const { config, env } = await loadConfig({ file: TEST_CONFIG, profile: 'low-power', envFile: path.join(ws, '.env') });
+  config.mcp = { maxFileBytes: 12 * 1024 * 1024 };
+  const bus = createBus();
+  const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, ws), env, bus });
+  const srv = await startServer({ config, env, orchestrator: orch, bus, workspaceDir: ws });
+  await srv.listen(0);
+  const base = `http://127.0.0.1:${srv.server.address().port}`;
+  const postMcp = async (msg) => {
+    const res = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(msg)
+    });
+    return { status: res.status, body: await res.json() };
+  };
+
+  try {
+    const chDir = path.join(ws, 'big-src');
+    await fs.mkdir(chDir, { recursive: true });
+    const bigBuf = Buffer.alloc(10.5 * 1024 * 1024, 'x');
+    Buffer.from('MARKER_AT_10MB').copy(bigBuf, 10 * 1024 * 1024);
+    await fs.writeFile(path.join(chDir, 'big.txt'), bigBuf);
+    const tooBigBuf = Buffer.alloc(13 * 1024 * 1024, 'y');
+    await fs.writeFile(path.join(chDir, 'toobig.txt'), tooBigBuf);
+
+    const ing = await postMcp({
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'ingest_challenge', arguments: { path: chDir } }
+    });
+    const cid = JSON.parse(ing.body.result.content[0].text).challengeId;
+
+    const slice = await postMcp({
+      jsonrpc: '2.0', id: 2, method: 'tools/call',
+      params: { name: 'read_artifact', arguments: { challengeId: cid, path: 'big.txt', offset: 10 * 1024 * 1024, maxBytes: 14 } }
+    });
+    const sliceData = JSON.parse(slice.body.result.content[0].text);
+    assert.equal(sliceData.content, 'MARKER_AT_10MB');
+    assert.equal(sliceData.size, bigBuf.length);
+    assert.equal(sliceData.truncated, true);
+
+    const err = await postMcp({
+      jsonrpc: '2.0', id: 3, method: 'tools/call',
+      params: { name: 'read_artifact', arguments: { challengeId: cid, path: 'toobig.txt' } }
+    });
+    assert.equal(err.body.result.isError, true);
+    assert.match(err.body.result.content[0].text, /mcp\.maxFileBytes/);
+  } finally {
+    await srv.close();
+    fs.rm(ws, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('P2-2: tcp_session evicts oldest idle session at maxSessions, lists sessions, and flags buffer overflow', async () => {
+  const ws = await tmpWorkspace('mcp-p2-2-');
+  const tcp = await startMockTcpChallenge();
+  const { config, env } = await loadConfig({ file: TEST_CONFIG, profile: 'low-power', envFile: path.join(ws, '.env') });
+  config.tcp = { maxSessions: 16, maxBufferMb: 0.001, idleTtlMin: 5 }; // ~1 KB buffer cap for overflow test
+  const bus = createBus();
+  const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, ws), env, bus });
+  const srv = await startServer({ config, env, orchestrator: orch, bus, workspaceDir: ws });
+  await srv.listen(0);
+  const base = `http://127.0.0.1:${srv.server.address().port}`;
+  const callTcp = async (args) => {
+    const res = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'tcp_session', arguments: args } })
+    });
+    const body = await res.json();
+    return JSON.parse(body.result.content[0].text);
+  };
+
+  try {
+    const sids = [];
+    for (let i = 0; i < 16; i++) {
+      const c = await callTcp({ action: 'connect', host: '127.0.0.1', port: tcp.port });
+      sids.push(c.sid);
+    }
+    const list16 = await callTcp({ action: 'list' });
+    assert.equal(list16.length, 16);
+
+    // 17th connect evicts the oldest idle session (sids[0])
+    const c17 = await callTcp({ action: 'connect', host: '127.0.0.1', port: tcp.port });
+    sids.push(c17.sid);
+    const listAfter = await callTcp({ action: 'list' });
+    assert.equal(listAfter.length, 16);
+    assert.equal(listAfter.some((s) => s.sid === sids[0]), false, 'oldest idle session evicted');
+    assert.equal(listAfter.some((s) => s.sid === c17.sid), true, 'new session present');
+
+    const evs = await replayFile(path.join(ws, 'console', 'mcp.jsonl'));
+    assert.ok(evs.some((e) => e.type === 'mcp.tcp' && e.data.action === 'evict' && e.data.sid === sids[0]));
+
+    for (const sid of sids.slice(1)) {
+      await callTcp({ action: 'close', sid });
+    }
+  } finally {
+    await srv.close();
+    tcp.srv.close();
     fs.rm(ws, { recursive: true, force: true }).catch(() => {});
   }
 });

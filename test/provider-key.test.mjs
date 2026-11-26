@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadConfig, resolveWorkspace } from '../src/config.mjs';
 import { createBus } from '../src/bus.mjs';
 import { createOrchestrator } from '../src/orchestrator.mjs';
@@ -10,7 +11,7 @@ import { getProvider, resolveApiKey } from '../src/providers/registry.mjs';
 import { preflightRoleProviders } from '../src/providers/preflight.mjs';
 import { tmpWorkspace } from './helpers.mjs';
 
-const ROOT = path.resolve(import.meta.dirname, '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TEST_CONFIG = path.join(ROOT, 'test', 'fixtures', 'test-config.json');
 const TOKEN = 't-' + 'a'.repeat(40);
 
@@ -148,3 +149,64 @@ test('universal key: settings provisioning on a varless entry writes OPENAI_API_
     fs.rm(ws, { recursive: true, force: true }).catch(() => {});
   }
 }));
+
+test('P1-8 & P1-9: openai-compat times out with provider_timeout and truncates outbound transcript bodies', async () => {
+  const { createOpenaiCompat } = await import('../src/providers/openai-compat.mjs');
+  const { createBudgetGuard } = await import('../src/budget.mjs');
+  const ws = await tmpWorkspace('prov-p1-');
+  const logSink = path.join(ws, 'outbound.jsonl');
+  const guard = createBudgetGuard({ usdCap: 5.0 });
+
+  // P1-8: never-resolving fetchFn that honors AbortSignal times out -> provider_timeout, no budget recorded
+  let sawSignal = false;
+  const hangingProv = createOpenaiCompat({
+    baseUrl: 'http://provider.test/v1',
+    apiKey: 'sk-test',
+    defaultModel: 'm1',
+    callTimeoutMs: 40,
+    retryBaseMs: 10,
+    fetchFn: (_url, opts) => new Promise((_resolve, reject) => {
+      sawSignal = opts?.signal instanceof AbortSignal;
+      const keepAlive = setTimeout(() => {}, 5000);
+      opts?.signal?.addEventListener('abort', () => {
+        clearTimeout(keepAlive);
+        reject(opts.signal.reason || Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      }, { once: true });
+    })
+  });
+  await assert.rejects(
+    () => hangingProv.chat({ messages: [{ role: 'user', content: 'hi' }] }),
+    (e) => e.code === 'provider_timeout'
+  );
+  assert.equal(sawSignal, true);
+  assert.equal(guard.spent.tokens, 0);
+
+  // P1-9: long messages truncated to transcriptBodyBytes with char/token estimates
+  const okProv = createOpenaiCompat({
+    baseUrl: 'http://provider.test/v1',
+    apiKey: 'sk-test',
+    defaultModel: 'm1',
+    transcriptBodyBytes: 64,
+    logSink,
+    fetchFn: async () => ({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 10, completion_tokens: 2 }
+      })
+    })
+  });
+  await okProv.chat({
+    messages: [{ role: 'user', content: 'A'.repeat(500) }],
+    meta: { worker: 'w-1', step: 1 }
+  });
+  const lines = (await fs.readFile(logSink, 'utf8')).trim().split('\n').map((l) => JSON.parse(l));
+  const out = lines.find((l) => l.kind === 'openai-compat.outbound');
+  assert.ok(out);
+  assert.equal(out.meta.worker, 'w-1');
+  assert.equal(out.messages[0].chars, 500);
+  assert.equal(out.messages[0].estTokens, 125);
+  assert.equal(out.messages[0].truncated, true);
+  assert.ok(Buffer.byteLength(out.messages[0].content, 'utf8') < 160);
+  fs.rm(ws, { recursive: true, force: true }).catch(() => {});
+});

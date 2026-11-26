@@ -15,8 +15,11 @@ export const DEFAULT_CONFIG = {
     maxRespawnsPerChallenge: 12
   },
   stall: { checkIntervalSec: 90, checksToPrune: 2 },
-  admission: { enabled: true, watermarkMb: 1536, meminfoPath: '/proc/meminfo', retryMs: 10000 },
-  budget: { perChallengeUsd: 5.00, perSwarmUsd: 5.00 },
+  admission: { enabled: true, watermarkMb: 1536, meminfoPath: '/proc/meminfo', retryMs: 10000, fallbackFreemem: true },
+  ingest: { maxExtractedBytes: 1024 * 1024 * 1024, maxExtractedEntries: 20000 },
+  mcp: { maxFileBytes: 64 * 1024 * 1024 },
+  tcp: { maxSessions: 16, maxBufferMb: 1, idleTtlMin: 5 },
+  budget: { perSwarmUsd: 5.00 },
   roles: {
     // Safe-by-default: unconfigured runs use the keyless mock provider.
     // Point these at "mistral" (or any provider key) in config.json.
@@ -28,6 +31,8 @@ export const DEFAULT_CONFIG = {
     lanes: {}
   },
   providers: {
+    callTimeoutMs: 120000,
+    transcriptBodyBytes: 2048,
     mistral: {
       type: 'openai-compat',
       baseUrl: 'https://api.mistral.ai/v1',
@@ -57,7 +62,7 @@ const LOW_POWER = {
 
 const KNOWN_KEYS = new Set([
   'port', 'workspace', 'profile', 'concurrency', 'worker', 'stall',
-  'admission', 'budget', 'roles', 'providers', 'denylist', 'git', 'runner', 'scrub'
+  'admission', 'ingest', 'mcp', 'tcp', 'budget', 'roles', 'providers', 'denylist', 'git', 'runner', 'scrub'
 ]);
 
 function deepMerge(base, over) {

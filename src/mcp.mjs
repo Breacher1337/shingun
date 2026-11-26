@@ -47,11 +47,11 @@ export const MCP_TOOLS = [
   },
   {
     name: 'tcp_session',
-    description: 'Persistent bidirectional TCP session (for silent nc-class CTF services). Actions: connect, send, recv, close.',
+    description: 'Persistent bidirectional TCP session (for silent nc-class CTF services). Actions: connect, send, recv, close, list.',
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['connect', 'send', 'recv', 'close'] },
+        action: { type: 'string', enum: ['connect', 'send', 'recv', 'close', 'list'] },
         sid: { type: 'string', description: 'Session id (required for send, recv, close)' },
         host: { type: 'string', description: 'Target host (required for connect)' },
         port: { type: 'integer', description: 'Target port 1..65535 (required for connect)' },
@@ -141,10 +141,26 @@ function isLikelyText(buf) {
   return true;
 }
 
-export function createMcpServer({ orchestrator, bus, workspaceDir }) {
+export function createMcpServer({ orchestrator, bus, workspaceDir, config }) {
   const challengesDir = path.join(workspaceDir, 'challenges');
+  const maxFileBytes = config?.mcp?.maxFileBytes ?? 64 * 1024 * 1024;
+  const tcpMaxSessions = config?.tcp?.maxSessions ?? 16;
+  const tcpMaxBufferBytes = (config?.tcp?.maxBufferMb ?? 1) * 1024 * 1024;
+  const tcpIdleTtlMs = (config?.tcp?.idleTtlMin ?? 5) * 60 * 1000;
   const stores = new Map(); // filePath -> store promise
   const tcpSessions = new Map(); // sid -> session
+  const tcpReaper = setInterval(() => {
+    const now = Date.now();
+    for (const [sid, sess] of tcpSessions) {
+      if (now - sess.lastActiveAt > tcpIdleTtlMs) {
+        try { sess.socket.destroy(); } catch { /* ignore */ }
+        sess.closed = true;
+        tcpSessions.delete(sid);
+        recordEvent(sess.challengeId, 'mcp.tcp', { action: 'evict', sid, reason: 'idle_ttl' }).catch(() => {});
+      }
+    }
+  }, Math.min(tcpIdleTtlMs, 30_000));
+  tcpReaper.unref?.();
 
   async function getStore(challengeId) {
     const key = challengeId ? `ch:${challengeId}` : 'console';
@@ -157,11 +173,20 @@ export function createMcpServer({ orchestrator, bus, workspaceDir }) {
     return stores.get(key);
   }
 
+  function validateChallengeId(challengeId) {
+    if (challengeId === undefined || challengeId === null || challengeId === '') return null;
+    if (typeof challengeId !== 'string' || !/^[\w-]+$/.test(challengeId)) {
+      throw mcpError('bad_request', 'challengeId must be a valid challenge id');
+    }
+    return challengeId;
+  }
+
   async function recordEvent(challengeId, type, data) {
-    const store = await getStore(challengeId);
+    const cid = validateChallengeId(challengeId);
+    const store = await getStore(cid);
     const ev = await store.append({
       type,
-      challenge: challengeId ?? null,
+      challenge: cid,
       swarm: null,
       worker: 'mcp',
       data
@@ -185,10 +210,16 @@ export function createMcpServer({ orchestrator, bus, workspaceDir }) {
   }
 
   function drainSession(sess) {
-    if (!sess.chunks.length) return { data: '', dataBase64: '' };
+    const overflowed = Boolean(sess.overflowed);
+    sess.overflowed = false;
+    if (!sess.chunks.length) {
+      sess.bufferedBytes = 0;
+      return { data: '', dataBase64: '', overflowed };
+    }
     const buf = Buffer.concat(sess.chunks);
     sess.chunks = [];
-    return { data: buf.toString('utf8'), dataBase64: buf.toString('base64') };
+    sess.bufferedBytes = 0;
+    return { data: buf.toString('utf8'), dataBase64: buf.toString('base64'), overflowed };
   }
 
   function waitForChunk(sess, timeoutMs, idleMs = 80) {
@@ -221,8 +252,20 @@ export function createMcpServer({ orchestrator, bus, workspaceDir }) {
 
   async function handleTcpSession(args) {
     const action = args?.action;
-    if (!['connect', 'send', 'recv', 'close'].includes(action)) {
-      throw mcpError('bad_request', 'action must be connect, send, recv, or close');
+    if (!['connect', 'send', 'recv', 'close', 'list'].includes(action)) {
+      throw mcpError('bad_request', 'action must be connect, send, recv, close, or list');
+    }
+
+    if (action === 'list') {
+      const now = Date.now();
+      return [...tcpSessions.values()].map((s) => ({
+        sid: s.sid,
+        host: s.host,
+        port: s.port,
+        challengeId: s.challengeId,
+        bufferedBytes: s.bufferedBytes,
+        ageSec: Math.floor((now - s.lastActiveAt) / 1000)
+      }));
     }
 
     if (action === 'connect') {
@@ -232,21 +275,40 @@ export function createMcpServer({ orchestrator, bus, workspaceDir }) {
         throw mcpError('bad_request', 'connect requires valid host and port (1..65535)');
       }
       const timeoutMs = Number.isFinite(args.timeoutMs) ? Math.max(50, Math.min(args.timeoutMs, 30000)) : 5000;
+      const challengeId = validateChallengeId(args.challengeId);
       const sid = newId('tcp');
       const socket = net.createConnection({ host, port });
+      const now = Date.now();
       const sess = {
         sid,
         socket,
         host,
         port,
-        challengeId: args.challengeId ?? null,
+        challengeId,
         chunks: [],
+        bufferedBytes: 0,
+        overflowed: false,
+        lastActiveAt: now,
         closed: false,
         error: null,
         waiters: new Set()
       };
       socket.on('data', (chunk) => {
-        sess.chunks.push(chunk);
+        sess.lastActiveAt = Date.now();
+        let c = chunk;
+        if (c.length > tcpMaxBufferBytes) {
+          c = c.subarray(c.length - tcpMaxBufferBytes);
+          sess.chunks = [];
+          sess.bufferedBytes = 0;
+          sess.overflowed = true;
+        }
+        sess.chunks.push(c);
+        sess.bufferedBytes += c.length;
+        while (sess.bufferedBytes > tcpMaxBufferBytes && sess.chunks.length > 0) {
+          const dropped = sess.chunks.shift();
+          sess.bufferedBytes -= dropped.length;
+          sess.overflowed = true;
+        }
         for (const fn of sess.waiters) fn();
       });
       socket.on('error', (err) => {
@@ -269,6 +331,19 @@ export function createMcpServer({ orchestrator, bus, workspaceDir }) {
         socket.once('error', (e) => { clearTimeout(timer); reject(mcpError('tcp_error', `TCP connect failed: ${e.message}`)); });
       });
 
+      if (tcpSessions.size >= tcpMaxSessions) {
+        let oldest = null;
+        for (const s of tcpSessions.values()) {
+          if (!oldest || s.lastActiveAt < oldest.lastActiveAt) oldest = s;
+        }
+        if (oldest) {
+          try { oldest.socket.destroy(); } catch { /* ignore */ }
+          oldest.closed = true;
+          tcpSessions.delete(oldest.sid);
+          await recordEvent(oldest.challengeId, 'mcp.tcp', { action: 'evict', sid: oldest.sid, reason: 'max_sessions' });
+        }
+      }
+
       tcpSessions.set(sid, sess);
       const bannerWait = Math.min(timeoutMs, 400);
       const banner = await waitForChunk(sess, bannerWait);
@@ -280,13 +355,15 @@ export function createMcpServer({ orchestrator, bus, workspaceDir }) {
     const sid = String(args.sid ?? '');
     const sess = tcpSessions.get(sid);
     if (!sess) throw mcpError('tcp_unknown', `unknown tcp session ${sid}`);
+    sess.lastActiveAt = Date.now();
 
     if (action === 'close') {
+      const overflowed = Boolean(sess.overflowed);
       sess.socket.destroy();
       sess.closed = true;
       tcpSessions.delete(sid);
-      await recordEvent(sess.challengeId, 'mcp.tcp', { action: 'close', sid });
-      return { sid, closed: true };
+      await recordEvent(sess.challengeId, 'mcp.tcp', { action: 'close', sid, ...(overflowed ? { overflowed: true } : {}) });
+      return { sid, closed: true, ...(overflowed ? { overflowed: true } : {}) };
     }
 
     if (action === 'send') {
@@ -299,14 +376,14 @@ export function createMcpServer({ orchestrator, bus, workspaceDir }) {
       const waitMs = Number.isFinite(args.timeoutMs) ? Math.max(0, Math.min(args.timeoutMs, 30000)) : 500;
       const reply = waitMs > 0 ? await waitForChunk(sess, waitMs) : drainSession(sess);
       await recordEvent(sess.challengeId, 'mcp.tcp', { action: 'send', sid, sentBytes: payload.length, recvBytes: reply.data.length });
-      return { sid, sentBytes: payload.length, data: reply.data, dataBase64: reply.dataBase64, closed: sess.closed };
+      return { sid, sentBytes: payload.length, data: reply.data, dataBase64: reply.dataBase64, closed: sess.closed, ...(reply.overflowed ? { overflowed: true } : {}) };
     }
 
     // action === 'recv'
     const waitMs = Number.isFinite(args.timeoutMs) ? Math.max(0, Math.min(args.timeoutMs, 30000)) : 1000;
     const recv = await waitForChunk(sess, waitMs);
     await recordEvent(sess.challengeId, 'mcp.tcp', { action: 'recv', sid, recvBytes: recv.data.length, closed: sess.closed });
-    return { sid, data: recv.data, dataBase64: recv.dataBase64, closed: sess.closed };
+    return { sid, data: recv.data, dataBase64: recv.dataBase64, closed: sess.closed, ...(recv.overflowed ? { overflowed: true } : {}) };
   }
 
   async function callTool(name, args = {}) {
@@ -363,21 +440,42 @@ export function createMcpServer({ orchestrator, bus, workspaceDir }) {
         const targetPath = path.resolve(baseDir, args.path);
         const check = await jail.check(targetPath);
         if (!check.ok) throw mcpError('path_jail', `path escapes challenge base: ${args.path}`);
-        const buf = await fs.readFile(check.resolved);
+        const st = await fs.stat(check.resolved);
         const offset = Math.max(0, Number(args.offset) || 0);
         const maxBytes = Math.max(1, Math.min(Number(args.maxBytes) || MAX_READ_BYTES, 1024 * 1024));
-        const slice = buf.subarray(offset, offset + maxBytes);
+        if (st.size > maxFileBytes && args.offset === undefined && args.maxBytes === undefined) {
+          throw mcpError('file_too_large', `file size ${st.size} exceeds mcp.maxFileBytes (${maxFileBytes})`);
+        }
+        const toRead = Math.max(0, Math.min(maxBytes, st.size - offset));
+        const slice = Buffer.alloc(toRead);
+        if (toRead > 0) {
+          const fh = await fs.open(check.resolved, 'r');
+          try {
+            let total = 0;
+            while (total < toRead) {
+              const { bytesRead } = await fh.read(slice, total, toRead - total, offset + total);
+              if (bytesRead === 0) break;
+              total += bytesRead;
+            }
+            if (total < toRead) {
+              // File shrank concurrently
+              slice.fill(0, total);
+            }
+          } finally {
+            await fh.close();
+          }
+        }
         const text = isLikelyText(slice);
         const out = {
           challengeId: args.challengeId,
           path: args.path,
-          size: buf.length,
+          size: st.size,
           offset,
           encoding: text ? 'utf8' : 'base64',
           content: slice.toString(text ? 'utf8' : 'base64'),
-          truncated: offset + slice.length < buf.length
+          truncated: offset + slice.length < st.size
         };
-        await recordEvent(args.challengeId, 'mcp.artifact.read', { path: args.path, size: buf.length });
+        await recordEvent(args.challengeId, 'mcp.artifact.read', { path: args.path, size: st.size });
         return out;
       }
 
@@ -464,7 +562,7 @@ export function createMcpServer({ orchestrator, bus, workspaceDir }) {
       }
 
       default:
-        throw mcpError('tool_unknown', `unknown tool ${name}`);
+        throw mcpError('tool_unknown', `Unknown tool: ${name}`);
     }
   }
 
@@ -484,7 +582,7 @@ export function createMcpServer({ orchestrator, bus, workspaceDir }) {
       switch (method) {
         case 'initialize': {
           const requested = params?.protocolVersion;
-          const protocolVersion = SUPPORTED_VERSIONS.has(requested) ? requested : '2024-11-05';
+          const protocolVersion = SUPPORTED_VERSIONS.has(requested) ? requested : '2025-06-18';
           result = {
             protocolVersion,
             capabilities: { tools: {} },
@@ -504,6 +602,10 @@ export function createMcpServer({ orchestrator, bus, workspaceDir }) {
             const data = await callTool(toolName, params?.arguments ?? {});
             result = { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
           } catch (err) {
+            if (err?.code === 'tool_unknown') {
+              if (isNotification) return null;
+              return { jsonrpc: '2.0', id, error: { code: -32602, message: err.message } };
+            }
             result = {
               content: [{ type: 'text', text: err?.message ?? String(err) }],
               isError: true
@@ -551,20 +653,28 @@ export function createMcpServer({ orchestrator, bus, workspaceDir }) {
       return;
     }
 
+    const maxMcpBytes = 64 * 1024 * 1024;
+    const cl = Number(req.headers['content-length']);
+    if (Number.isFinite(cl) && cl > maxMcpBytes) {
+      throw mcpError('payload_too_large', 'MCP request exceeds 64MB');
+    }
     const bodyText = await new Promise((resolve, reject) => {
       const chunks = [];
       let size = 0;
+      let done = false;
       req.on('data', (c) => {
+        if (done) return;
         size += c.length;
-        if (size > 64 * 1024 * 1024) {
-          req.destroy();
+        if (size > maxMcpBytes) {
+          done = true;
+          req.pause();
           reject(mcpError('payload_too_large', 'MCP request exceeds 64MB'));
           return;
         }
         chunks.push(c);
       });
-      req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-      req.on('error', reject);
+      req.on('end', () => { if (!done) { done = true; resolve(Buffer.concat(chunks).toString('utf8')); } });
+      req.on('error', (e) => { if (!done) { done = true; reject(e); } });
     });
 
     let payload;
@@ -576,26 +686,32 @@ export function createMcpServer({ orchestrator, bus, workspaceDir }) {
       return;
     }
 
-    const sessionId = req.headers['mcp-session-id'] || newId('mcp');
     if (Array.isArray(payload)) {
       const responses = (await Promise.all(payload.map((m) => handleRpc(m)))).filter(Boolean);
       if (!responses.length) {
-        res.writeHead(202, { 'Mcp-Session-Id': sessionId });
+        res.writeHead(202);
         res.end();
         return;
       }
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Mcp-Session-Id': sessionId });
+      const hasInit = payload.some((m, i) => m?.method === 'initialize') && responses.some((r) => r && !r.error);
+      const headers = { 'Content-Type': 'application/json; charset=utf-8' };
+      if (hasInit) headers['Mcp-Session-Id'] = newId('mcp');
+      res.writeHead(200, headers);
       res.end(JSON.stringify(responses));
       return;
     }
 
     const response = await handleRpc(payload);
     if (!response) {
-      res.writeHead(202, { 'Mcp-Session-Id': sessionId });
+      res.writeHead(202);
       res.end();
       return;
     }
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Mcp-Session-Id': sessionId });
+    const headers = { 'Content-Type': 'application/json; charset=utf-8' };
+    if (payload?.method === 'initialize' && !response.error) {
+      headers['Mcp-Session-Id'] = newId('mcp');
+    }
+    res.writeHead(200, headers);
     res.end(JSON.stringify(response));
   }
 
@@ -657,6 +773,7 @@ export function createMcpServer({ orchestrator, bus, workspaceDir }) {
   }
 
   function closeAll() {
+    clearInterval(tcpReaper);
     for (const sess of tcpSessions.values()) {
       try { sess.socket.destroy(); } catch { /* ignore */ }
     }

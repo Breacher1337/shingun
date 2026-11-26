@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createLabServer } from '../examples/sqli-lab/app.mjs';
 
 /**
@@ -10,7 +11,7 @@ import { createLabServer } from '../examples/sqli-lab/app.mjs';
  * SQL injection surfaces, so the offline demo solves it on record.
  */
 
-const ROOT = path.resolve(import.meta.dirname, '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LAB_DIR = path.join(ROOT, 'examples', 'sqli-lab');
 const SOLVER = path.join(ROOT, 'test', 'fixtures', 'mock', 'worker.sqli-lab.json');
 

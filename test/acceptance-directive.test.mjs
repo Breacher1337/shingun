@@ -3,12 +3,13 @@ import assert from 'node:assert';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadConfig, resolveWorkspace } from '../src/config.mjs';
 import { createBus } from '../src/bus.mjs';
 import { createOrchestrator } from '../src/orchestrator.mjs';
 import { ingestChallenge } from '../src/ingest.mjs';
 
-const ROOT = path.resolve(import.meta.dirname, '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 test('engine: master directive answered via master.chat events', async () => {
   const ws = await fs.mkdtemp(path.join(os.tmpdir(), 'dir-'));

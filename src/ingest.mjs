@@ -30,7 +30,11 @@ import { ensureDir, listTree, newId } from './util.mjs';
  */
 
 const DEFAULT_MAX_BYTES = 256 * 1024 * 1024;
+const DEFAULT_MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024;
+const DEFAULT_MAX_EXTRACTED_ENTRIES = 20000;
 const DOWNLOAD_TIMEOUT_MS = 120_000;
+
+const isMaxOutputErr = (e) => e instanceof RangeError || e?.code === 'ERR_BUFFER_TOO_LARGE' || /maxOutputLength/i.test(e?.message ?? '');
 
 function httpError(code, message) {
   return Object.assign(new Error(message), { code });
@@ -95,12 +99,18 @@ function strn(field) {
   return (end === -1 ? field : field.subarray(0, end)).toString('utf8');
 }
 
-function extractTar(buffer, destDir) {
+function extractTar(buffer, destDir, { maxExtractedBytes = DEFAULT_MAX_EXTRACTED_BYTES, maxExtractedEntries = DEFAULT_MAX_EXTRACTED_ENTRIES } = {}) {
   const destRoot = path.resolve(destDir);
   let wrote = 0;
+  let entries = 0;
+  let writtenBytes = 0;
   for (let off = 0; off + 512 <= buffer.length;) {
     const header = buffer.subarray(off, off + 512);
     if (header.every((b) => b === 0)) break; // end-of-archive marker
+    entries += 1;
+    if (entries > maxExtractedEntries) {
+      throw httpError('ingest_too_large', `tar archive exceeds maxExtractedEntries (${maxExtractedEntries})`);
+    }
     const name = strn(header.subarray(0, 100));
     const size = oct(header.subarray(124, 136));
     const type = String.fromCharCode(header[156] || 0x30);
@@ -116,6 +126,10 @@ function extractTar(buffer, destDir) {
       continue;
     }
     if (type !== '0' && type !== 0) continue; // links, devices, pax headers: skipped
+    if (writtenBytes + size > maxExtractedBytes) {
+      throw httpError('ingest_too_large', `tar archive exceeds maxExtractedBytes (${maxExtractedBytes})`);
+    }
+    writtenBytes += size;
     ensureDirSync(path.dirname(resolved));
     fsSyncWrite(resolved, buffer.subarray(dataStart, dataStart + size));
     wrote += 1;
@@ -149,13 +163,19 @@ function crc32(buf) {
  * (sizes parked in a data descriptor) are refused — every packager users
  * actually meet writes local sizes.
  */
-function extractZip(buffer, destDir) {
+function extractZip(buffer, destDir, { maxExtractedBytes = DEFAULT_MAX_EXTRACTED_BYTES, maxExtractedEntries = DEFAULT_MAX_EXTRACTED_ENTRIES } = {}) {
   const destRoot = path.resolve(destDir);
   let wrote = 0;
+  let entries = 0;
+  let writtenBytes = 0;
   let off = 0;
   while (off + 4 <= buffer.length) {
     if (buffer.readUInt32LE(off) !== 0x04034b50) break; // local file signature
     if (off + 30 > buffer.length) throw httpError('ingest_zip_corrupt', 'truncated zip header');
+    entries += 1;
+    if (entries > maxExtractedEntries) {
+      throw httpError('ingest_too_large', `zip archive exceeds maxExtractedEntries (${maxExtractedEntries})`);
+    }
     const flags = buffer.readUInt16LE(off + 6);
     const method = buffer.readUInt16LE(off + 8);
     const crcStored = buffer.readUInt32LE(off + 14);
@@ -180,13 +200,33 @@ function extractZip(buffer, destDir) {
     if (method !== 0 && method !== 8) {
       throw httpError('ingest_zip_corrupt', `unsupported zip compression method ${method}: ${name}`);
     }
-    const data = method === 8 ? inflateRawSync(buffer.subarray(dataStart, dataEnd)) : buffer.subarray(dataStart, dataEnd);
+    const remaining = maxExtractedBytes - writtenBytes;
+    if (remaining <= 0 || uSize > remaining) {
+      throw httpError('ingest_too_large', `zip archive exceeds maxExtractedBytes (${maxExtractedBytes}): ${name}`);
+    }
+    let data;
+    if (method === 8) {
+      try {
+        data = inflateRawSync(buffer.subarray(dataStart, dataEnd), { maxOutputLength: remaining });
+      } catch (e) {
+        if (isMaxOutputErr(e)) {
+          throw httpError('ingest_too_large', `zip entry exceeds maxExtractedBytes (${maxExtractedBytes}): ${name}`);
+        }
+        throw e;
+      }
+    } else {
+      data = buffer.subarray(dataStart, dataEnd);
+      if (data.length > remaining) {
+        throw httpError('ingest_too_large', `zip entry exceeds maxExtractedBytes (${maxExtractedBytes}): ${name}`);
+      }
+    }
     if (data.length !== uSize) {
       throw httpError('ingest_zip_corrupt', `zip entry size mismatch: ${name}`);
     }
     if (crc32(data) !== crcStored) {
       throw httpError('ingest_zip_corrupt', `zip entry failed its CRC check: ${name}`);
     }
+    writtenBytes += data.length;
     ensureDirSync(path.dirname(resolved));
     fsSyncWrite(resolved, data);
     wrote += 1;
@@ -205,14 +245,22 @@ const looksArchiveGz = (filename, buffer) =>
  * and local archive files. Zip extracts, tar.gz extracts, anything else
  * is stored as a single named artifact.
  */
-function materializeBuffer(buffer, filename, baseDir, { contentType = '' } = {}) {
+function materializeBuffer(buffer, filename, baseDir, { contentType = '', maxExtractedBytes = DEFAULT_MAX_EXTRACTED_BYTES, maxExtractedEntries = DEFAULT_MAX_EXTRACTED_ENTRIES } = {}) {
   if (looksArchiveZip(filename, contentType)) {
-    const files = extractZip(buffer, baseDir);
+    const files = extractZip(buffer, baseDir, { maxExtractedBytes, maxExtractedEntries });
     return { kind: 'archive', filename, files };
   }
   if (looksArchiveGz(filename, buffer)) {
-    const tar = gunzipSync(buffer);
-    const files = extractTar(tar, baseDir);
+    let tar;
+    try {
+      tar = gunzipSync(buffer, { maxOutputLength: maxExtractedBytes });
+    } catch (e) {
+      if (isMaxOutputErr(e)) {
+        throw httpError('ingest_too_large', `archive ${filename} exceeds maxExtractedBytes (${maxExtractedBytes})`);
+      }
+      throw e;
+    }
+    const files = extractTar(tar, baseDir, { maxExtractedBytes, maxExtractedEntries });
     if (files === 0) {
       throw httpError('ingest_download_failed', `archive ${filename} contains no extractable files`);
     }
@@ -224,9 +272,9 @@ function materializeBuffer(buffer, filename, baseDir, { contentType = '' } = {})
   return { kind: 'file', filename: safe };
 }
 
-async function materializeDownload(url, baseDir, maxBytes) {
+async function materializeDownload(url, baseDir, maxBytes, caps) {
   const { buffer, contentType } = await fetchCapped(url, maxBytes);
-  return materializeBuffer(buffer, nameFromUrl(url), baseDir, { contentType });
+  return materializeBuffer(buffer, nameFromUrl(url), baseDir, { contentType, ...caps });
 }
 
 async function normalizeRepo(baseDir) {
@@ -262,55 +310,77 @@ export function targetMarkdown(target) {
   ].filter(Boolean).join('\n') + '\n';
 }
 
-export async function ingestChallenge({ source, value, challengesDir, challengeId, target, maxBytes = DEFAULT_MAX_BYTES }) {
+export async function ingestChallenge({
+  source,
+  value,
+  challengesDir,
+  challengeId,
+  target,
+  maxBytes = DEFAULT_MAX_BYTES,
+  maxExtractedBytes = DEFAULT_MAX_EXTRACTED_BYTES,
+  maxExtractedEntries = DEFAULT_MAX_EXTRACTED_ENTRIES
+}) {
+  if (challengeId !== undefined && challengeId !== null && (typeof challengeId !== 'string' || !/^[\w.-]+$/.test(challengeId))) {
+    throw httpError('bad_request', 'challengeId must be a valid identifier');
+  }
   const id = challengeId ?? newId('ch');
   const safeTarget = validateTarget(target);
-  const baseDir = path.join(challengesDir, id, 'base');
+  const chDir = path.join(challengesDir, id);
+  const baseDir = path.join(chDir, 'base');
+  const existed = await fs.stat(chDir).then(() => true).catch(() => false);
+  const caps = { maxExtractedBytes, maxExtractedEntries };
   await ensureDir(path.dirname(baseDir));
 
-  if (source === 'url') {
-    // URL ending in a downloadable archive is a download, not a git repo.
-    if (/\.(tar\.gz|tgz|zip)$/i.test(String(value).split(/[?#]/)[0])) {
-      throw httpError('bad_request', `use source \"download\" for archive URLs — \"url\" is for git repositories`);
-    }
-    const res = await execDirect('git', ['clone', '--depth', '50', value, baseDir], { timeoutSec: 300, outputCap: 4096 });
-    if (res.exitCode !== 0) {
-      throw Object.assign(new Error(`git clone failed: ${res.stderr}`), { code: 'ingest_clone_failed' });
-    }
-  } else if (source === 'download') {
-    await materializeDownload(String(value).trim(), baseDir, maxBytes);
-  } else if (source === 'upload') {
-    // Raw bytes uploaded from the dashboard (a file picker away): buffer +
-    // filename; the caller caps the body at the same maxBytes ceiling.
-    materializeBuffer(value.data, value.filename || 'upload.bin', baseDir);
-  } else if (source === 'none') {
-    await ensureDir(baseDir); // a pure live-web challenge: the base is just the target
-  } else {
-    const src = path.resolve(value);
-    const stat = await fs.stat(src).catch(() => null);
-    if (stat?.isFile()) {
-      // A downloaded artifact (picoCTF ships zips): extract or store it.
-      if (stat.size > maxBytes) {
-        throw httpError('ingest_too_large', `local file exceeds the ${Math.round(maxBytes / 1024 / 1024)}MB ingest cap: ${src}`);
+  try {
+    if (source === 'url') {
+      // URL ending in a downloadable archive is a download, not a git repo.
+      if (/\.(tar\.gz|tgz|zip)$/i.test(String(value).split(/[?#]/)[0])) {
+        throw httpError('bad_request', `use source \"download\" for archive URLs — \"url\" is for git repositories`);
       }
-      materializeBuffer(await fs.readFile(src), path.basename(src), baseDir);
-    } else if (stat?.isDirectory()) {
-      const exists = await fs.stat(baseDir).then(() => true).catch(() => false);
-      if (exists) {
-        throw Object.assign(new Error(`challenge base already exists: ${baseDir}`), { code: 'ingest_bad_path' });
+      const res = await execDirect('git', ['clone', '--depth', '50', value, baseDir], { timeoutSec: 300, outputCap: 4096 });
+      if (res.exitCode !== 0) {
+        throw Object.assign(new Error(`git clone failed: ${res.stderr}`), { code: 'ingest_clone_failed' });
       }
-      await fs.cp(src, baseDir, { recursive: true, force: true, errorOnExist: false });
+    } else if (source === 'download') {
+      await materializeDownload(String(value).trim(), baseDir, maxBytes, caps);
+    } else if (source === 'upload') {
+      // Raw bytes uploaded from the dashboard (a file picker away): buffer +
+      // filename; the caller caps the body at the same maxBytes ceiling.
+      materializeBuffer(value.data, value.filename || 'upload.bin', baseDir, caps);
+    } else if (source === 'none') {
+      await ensureDir(baseDir); // a pure live-web challenge: the base is just the target
     } else {
-      throw Object.assign(new Error(`challenge path is neither a folder nor a file: ${src}`), { code: 'ingest_bad_path' });
+      const src = path.resolve(value);
+      const stat = await fs.stat(src).catch(() => null);
+      if (stat?.isFile()) {
+        // A downloaded artifact (picoCTF ships zips): extract or store it.
+        if (stat.size > maxBytes) {
+          throw httpError('ingest_too_large', `local file exceeds the ${Math.round(maxBytes / 1024 / 1024)}MB ingest cap: ${src}`);
+        }
+        materializeBuffer(await fs.readFile(src), path.basename(src), baseDir, caps);
+      } else if (stat?.isDirectory()) {
+        const exists = await fs.stat(baseDir).then(() => true).catch(() => false);
+        if (exists) {
+          throw Object.assign(new Error(`challenge base already exists: ${baseDir}`), { code: 'ingest_bad_path' });
+        }
+        await fs.cp(src, baseDir, { recursive: true, force: true, errorOnExist: false });
+      } else {
+        throw Object.assign(new Error(`challenge path is neither a folder nor a file: ${src}`), { code: 'ingest_bad_path' });
+      }
     }
-  }
 
-  if (safeTarget) {
-    await fs.writeFile(path.join(baseDir, 'TARGET.md'), targetMarkdown(safeTarget), 'utf8');
-  }
+    if (safeTarget) {
+      await fs.writeFile(path.join(baseDir, 'TARGET.md'), targetMarkdown(safeTarget), 'utf8');
+    }
 
-  if (source !== 'url') {
-    await normalizeRepo(baseDir);
+    if (source !== 'url') {
+      await normalizeRepo(baseDir);
+    }
+  } catch (err) {
+    if (!existed) {
+      await fs.rm(chDir, { recursive: true, force: true }).catch(() => {});
+    }
+    throw err;
   }
 
   const { fileCount, topFiles } = await listTree(baseDir);

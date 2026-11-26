@@ -3,12 +3,13 @@ import assert from 'node:assert';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { loadConfig, resolveWorkspace } from '../src/config.mjs';
 import { createBus } from '../src/bus.mjs';
 import { createOrchestrator } from '../src/orchestrator.mjs';
 
-const HERE = import.meta.dirname;
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.dirname(HERE);
 const FIXTURE = path.join(ROOT, 'test', 'fixtures', 'challenge-easy');
 const TEST_CONFIG = path.join(ROOT, 'test', 'fixtures', 'test-config.json');
@@ -103,5 +104,35 @@ test('acceptance 6: crash + resume — swarm completes after a hard kill', async
     swarmStatus: [...evs].reverse().find((e) => e.type === 'swarm.update')?.data?.status
   });
   assert.equal(summarize(events), summarize(await s.store.replay()), 'replay is deterministic');
+  fs.rm(ws, { recursive: true, force: true }).catch(() => {});
+});
+
+test('P1-10: resume rehydrates budget guard from usage.tick events and blocks overspend', async () => {
+  const { openEventStore } = await import('../src/store.mjs');
+  const { tmpWorkspace } = await import('./helpers.mjs');
+  const ws = await tmpWorkspace('resume-budget-');
+  const { config, env } = await loadConfig({ file: TEST_CONFIG, profile: 'low-power' });
+  config.budget.perSwarmUsd = 1.00;
+  const chDir = path.join(ws, 'challenges', 'ch-p110');
+  await fs.mkdir(path.join(chDir, 'base'), { recursive: true });
+  await fs.mkdir(path.join(chDir, 'events'), { recursive: true });
+  const store = await openEventStore(path.join(chDir, 'events', 'sw-p110.jsonl'), { swarmId: 'sw-p110' });
+  await store.append({ type: 'challenge.ingested', swarm: 'sw-p110', challenge: 'ch-p110', data: { sourceType: 'none', sourceValue: '' } });
+  await store.append({ type: 'swarm.update', swarm: 'sw-p110', challenge: 'ch-p110', data: { status: 'running' } });
+  await store.append({ type: 'worker.spawn', swarm: 'sw-p110', challenge: 'ch-p110', worker: 'w-1', data: { persona: 'hypothesis-prover' } });
+  await store.append({ type: 'worker.status', swarm: 'sw-p110', challenge: 'ch-p110', worker: 'w-1', data: { status: 'reasoning' } });
+  // mock pricePerMTok is { in: 0.70, out: 2.10 }; 500k in ($0.35) + 300k out ($0.63) = $0.98
+  await store.append({ type: 'usage.tick', swarm: 'sw-p110', challenge: 'ch-p110', worker: 'w-1', data: { role: 'worker', provider: 'mock', tokensIn: 500_000, tokensOut: 300_000 } });
+
+  const bus = createBus();
+  const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, ws), env, bus });
+  const resumed = await orch.resume();
+  assert.deepEqual(resumed, ['sw-p110']);
+  const s = orch.swarms.get('sw-p110');
+  const pre = s.capGuard.preflight({ estTokens: 50_000, priceIn: 0.70, priceOut: 2.10 }); // +$0.07 > $1.00
+  assert.equal(pre.ok, false, 'resumed capGuard must block spend exceeding original cap');
+  const evs = await s.store.replay();
+  assert.ok(evs.some((e) => e.type === 'budget.resumed' && Math.abs(e.data.usd - 0.98) < 1e-6 && e.data.tokens === 800_000));
+  await orch.stop('sw-p110', 'test-teardown').catch(() => {});
   fs.rm(ws, { recursive: true, force: true }).catch(() => {});
 });

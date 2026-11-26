@@ -10,7 +10,7 @@ append-only JSONL event logging, and an optional headless swarm runner.
 
 ## Requirements
 
-- Node.js ≥ 20 (ESM only — no `npm install`)
+- Node.js ≥ 18 (ESM only — no `npm install`; ≥ 20 recommended)
 - `git` on `PATH` (for normalized challenge base repos and optional swarm worktrees)
 
 ## Quickstart
@@ -98,8 +98,8 @@ Add to `mcp_config.json`:
 | Tool | Arguments | Purpose |
 | --- | --- | --- |
 | `ingest_challenge` | `{url\|path\|bytes?, filename?, title?, hint?, target?, flagFormatRegex?, categoryHint?}` | Ingest git repo, local folder/file, archive URL, base64 zip/tar.gz, or `http(s)://`/`tcp://` target into `challenges/<id>/base` |
-| `tcp_session` | `{action: "connect"\|"send"\|"recv"\|"close", sid?, host?, port?, data?, encoding?, timeoutMs?, challengeId?}` | Persistent bidirectional TCP socket for interactive `nc` services |
-| `read_artifact` | `{challengeId, path, offset?, maxBytes?}` | Path-jailed read inside `challenges/<id>/base` |
+| `tcp_session` | `{action: "connect"\|"send"\|"recv"\|"close"\|"list", sid?, host?, port?, data?, encoding?, timeoutMs?, challengeId?}` | Persistent bidirectional TCP socket for interactive `nc` services (capped at `tcp.maxSessions` / `tcp.maxBufferMb` / `tcp.idleTtlMin`) |
+| `read_artifact` | `{challengeId, path, offset?, maxBytes?}` | Path-jailed ranged read inside `challenges/<id>/base` (errors `file_too_large` over `mcp.maxFileBytes` when unsliced) |
 | `search_artifacts` | `{challengeId, pattern, maxHits?}` | Regex search across `challenges/<id>/base` |
 | `submit_flag` | `{challengeId, flag, reasoning?}` | Append `flag.found` to the challenge event store (checked against `flagFormatRegex` if set) |
 | `swarm_run` | `{challengeId, workers?}` | Launch an optional headless worker swarm |
@@ -144,15 +144,16 @@ HTTP JSON routes (set `SHINGUN_TOKEN` in `.env` to require `Authorization: Beare
 
 ## Security
 
-- Server binds `127.0.0.1` only and refuses non-loopback `Host` headers (`403 host_forbidden`).
-- Challenge inputs and LLM tool calls are untrusted; run on a disposable host when executing challenge binaries or swarms.
-- Optional spend insurance: one invisible per-swarm hard cap (`budget.perSwarmUsd`) enforced in preflight.
+- Server binds `127.0.0.1` only, refuses non-loopback `Host` headers (`403 host_forbidden`), and refuses non-loopback `Origin` headers on mutating `/mcp` and `/api/*` requests (`403 origin_forbidden`).
+- Challenge inputs and LLM tool calls are untrusted; archive extraction enforces `ingest.maxExtractedBytes` and `ingest.maxExtractedEntries` (`413 ingest_too_large`), and provider calls enforce `providers.callTimeoutMs` (`provider_timeout`) and `providers.transcriptBodyBytes`. Run on a disposable host when executing challenge binaries or swarms.
+- Optional spend insurance: one invisible per-swarm hard cap (`budget.perSwarmUsd`) enforced in preflight and rehydrated from `usage.tick` events on resume (`budget.resumed`).
 - `.env` secret values are scrubbed before outbound provider calls (`src/scrub.mjs`).
 
 ## Tests
 
 ```sh
-node --test --test-concurrency=1 "test/*.test.mjs"
+node --test "test/*.test.mjs"
+# On Node >= 20, you can also pass --test-concurrency=1
 ```
 
 ## License

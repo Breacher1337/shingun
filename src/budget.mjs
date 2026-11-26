@@ -3,9 +3,9 @@
  * No multi-scope ledgers or lane accounting — one invisible cap per swarm
  * as spend insurance.
  */
-export function createBudgetGuard({ usdCap = Infinity, onCapped } = {}) {
-  let usd = 0;
-  let tokens = 0;
+export function createBudgetGuard({ usdCap = Infinity, initialUsd = 0, initialTokens = 0, onCapped } = {}) {
+  let usd = initialUsd;
+  let tokens = initialTokens;
 
   return {
     preflight({ estTokens = 0, priceIn = 0, priceOut = 0 } = {}) {

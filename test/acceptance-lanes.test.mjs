@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { runCli, tmpWorkspace, FIXTURE } from './helpers.mjs';
 import { getProvider } from '../src/providers/registry.mjs';
 
-const ROOT = path.resolve(import.meta.dirname, '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LANES_CONFIG = path.join(ROOT, 'test', 'fixtures', 'test-config-lanes.json');
 
 test('model lane: registry resolves lanes:<name> through roles.lanes', () => {

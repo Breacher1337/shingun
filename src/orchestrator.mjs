@@ -38,6 +38,45 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
     return getProvider(config, role, { scrubber, env, logSink });
   }
 
+  function meterMasterProvider(inner, { capGuard = null, emit, scope } = {}) {
+    const price = inner.price ?? { in: 0.70, out: 2.10 };
+    return {
+      ...inner,
+      async chat(callOpts) {
+        if (capGuard) {
+          const estTokens = Math.ceil((callOpts?.messages ?? []).reduce((n, m) => n + String(m.content ?? '').length, 0) / 4);
+          const pre = capGuard.preflight({ estTokens, priceIn: price.in, priceOut: price.out });
+          if (!pre.ok) {
+            await emit('budget.capped', { scope: 'swarm', capName: pre.capName, role: 'master', reason: pre.message });
+            throw Object.assign(new Error(pre.message), { code: 'budget_capped' });
+          }
+        }
+        const res = await inner.chat(callOpts);
+        const tin = res.usage?.tokensIn ?? 0;
+        const tout = res.usage?.tokensOut ?? 0;
+        let costUsd;
+        if (capGuard) {
+          const rec = capGuard.record({ tokensIn: tin, tokensOut: tout, priceIn: price.in, priceOut: price.out });
+          costUsd = rec.usd;
+          if (rec.crossed) {
+            await emit('budget.capped', { scope: 'swarm', capName: 'usdCap', role: 'master', reason: rec.message });
+          }
+        } else {
+          costUsd = (tin / 1e6) * price.in + (tout / 1e6) * price.out;
+        }
+        await emit('usage.tick', {
+          role: 'master',
+          ...(scope ? { scope } : {}),
+          provider: inner.name ?? 'unknown',
+          tokensIn: tin,
+          tokensOut: tout,
+          costUsd
+        });
+        return res;
+      }
+    };
+  }
+
   /**
    * Worker provider resolution with per-persona model lanes: a persona whose
    * catalog entry names a lane rides roles.lanes.<name> when that lane is
@@ -104,7 +143,10 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
     s.emit = emit;
 
     // 1. Triage.
-    const masterProvider = getProviderFor('master', { logSink: path.join(chDir, 'transcripts', 'master.outbound.jsonl') });
+    const masterProvider = meterMasterProvider(
+      getProviderFor('master', { logSink: path.join(chDir, 'transcripts', 'master.outbound.jsonl') }),
+      { capGuard: s.capGuard, emit }
+    );
     await emit('challenge.ingested', {
       sourceType: challenge.sourceType, sourceValue: challenge.sourceValue,
       fileCount: challenge.fileCount, topFiles: challenge.topFiles, category: challenge.categoryHint,
@@ -312,7 +354,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
       const wid3 = newId('w');
       s.workers.set(wid2, syncStub(wid2, 'respawn-new'));
       s.workers.set(wid3, syncStub(wid3, 'respawn-variant'));
-      const masterProvider = getProviderFor('master');
+      const masterProvider = meterMasterProvider(getProviderFor('master'), { capGuard: s.capGuard, emit: s.emit });
       const notes = await readNotes(path.join(s.chDir, 'notes.jsonl')).catch(() => []);
       const dead = s.deadStrategies.map((d) => `${d.persona}: ${d.note}`);
       const digestText = await buildDigest({
@@ -408,7 +450,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
       return { reply, actions: [] };
     }
     await emit('master.chat', { direction: 'user', text, scope: 'sw' });
-    const masterProvider = getProviderFor('master');
+    const masterProvider = meterMasterProvider(getProviderFor('master'), { capGuard: s.capGuard, emit });
     const rawOps = {
       spawn_worker: async (args) => {
         const persona = args.persona && PERSONA_CATALOG[args.persona] ? args.persona : 'hypothesis-prover';
@@ -482,7 +524,9 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
       challengesDir,
       challengeId,
       target: safeTarget,
-      maxBytes
+      maxBytes,
+      maxExtractedBytes: config.ingest?.maxExtractedBytes,
+      maxExtractedEntries: config.ingest?.maxExtractedEntries
     });
     const chDir = path.join(challengesDir, ing.challengeId);
     await writeJson(path.join(chDir, 'challenge.json'), {
@@ -651,7 +695,15 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
     const store = getConsoleStore();
     const thread = await store.seed(30);
     await store.appendChat({ direction: 'user', text, scope: 'console' });
-    const masterProvider = getProviderFor('master', { logSink: store.logSink });
+    const usageStore = await openEventStore(path.join(workspaceDir, 'console', 'usage.jsonl'), { swarmId: 'console' });
+    const masterProvider = meterMasterProvider(getProviderFor('master', { logSink: store.logSink }), {
+      scope: 'console',
+      emit: async (type, data) => {
+        const ev = await usageStore.append({ type, swarm: null, challenge: null, data });
+        bus?.publish(ev);
+        return ev;
+      }
+    });
     const rawOps = {
       status_node: async () => ({ ...(await statusNode()) }),
       create_challenge: async (args) => createChallenge(args),
@@ -782,9 +834,27 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
           flagFormatSource: triageEv?.flagFormat?.source ?? 'unknown'
         };
 
+        const workerProvName = config.roles?.worker?.provider;
+        const fallbackPrice = config.providers?.[workerProvName]?.pricePerMTok ?? { in: 0.70, out: 2.10 };
+        let seededUsd = 0;
+        let seededTokens = 0;
+        for (const e of events) {
+          if (e.type !== 'usage.tick') continue;
+          const tin = Number(e.data?.tokensIn) || 0;
+          const tout = Number(e.data?.tokensOut) || 0;
+          const provName = e.data?.provider;
+          const price = config.providers?.[provName]?.pricePerMTok ?? fallbackPrice;
+          seededUsd += (tin / 1e6) * (price.in ?? 0) + (tout / 1e6) * (price.out ?? 0);
+          seededTokens += tin + tout;
+        }
+
         const s = {
           id: swarmId, challengeId: cid, challenge, chDir, store,
-          capGuard: createBudgetGuard({ usdCap: config.budget.perSwarmUsd }),
+          capGuard: createBudgetGuard({
+            usdCap: config.budget.perSwarmUsd,
+            initialUsd: seededUsd,
+            initialTokens: seededTokens
+          }),
           status: 'running', workers: new Map(perWorker), flags,
           respawns: 0,
           deadStrategies: events.filter((e) => e.type === 'worker.pruned').map((e) => ({ persona: e.data.persona ?? 'unknown', note: e.data.reason ?? '' })),
@@ -797,6 +867,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
           return full;
         };
         s.emit = emit;
+        await emit('budget.resumed', { usd: seededUsd, tokens: seededTokens });
 
         if (flags.length) {
           s.status = 'solved';
@@ -813,7 +884,7 @@ export function createOrchestrator({ config, workspaceDir, env = {}, bus, memSam
             .map((e) => e.worker))];
           const notes = await readNotes(path.join(chDir, 'notes.jsonl')).catch(() => []);
           const digestText = fallbackDigest(notes, s.deadStrategies.map((x) => `${x.persona}: ${x.note}`));
-          const masterProvider = getProviderFor('master');
+          const masterProvider = meterMasterProvider(getProviderFor('master'), { capGuard: s.capGuard, emit: s.emit });
           const respawnIds = uniqUnfinished.length
             ? uniqUnfinished.slice(0, config.concurrency.perChallengeWorkers)
             : [null];

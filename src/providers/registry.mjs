@@ -39,7 +39,14 @@ export function getProvider(config, roleName, { scrubber, logSink, fetchFn, env 
   };
   if (prov.type === 'openai-compat') {
     const apiKey = resolveApiKey(prov, env);
-    return createOpenaiCompat({ ...prov, apiKey, fetchFn, ...shared });
+    return createOpenaiCompat({
+      ...prov,
+      apiKey,
+      fetchFn,
+      callTimeoutMs: config.providers?.callTimeoutMs ?? 120_000,
+      transcriptBodyBytes: config.providers?.transcriptBodyBytes ?? 2048,
+      ...shared
+    });
   }
   if (prov.type === 'mock') {
     return createMock({ ...prov, ...shared });

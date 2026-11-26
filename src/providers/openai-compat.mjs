@@ -1,13 +1,26 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { sleep } from '../util.mjs';
+import { sleep, truncateBytes } from '../util.mjs';
 
 /**
  * OpenAI-compatible chat client: the single metering choke point. Scrubs
  * text egress, retries 429/5xx with backoff, surfaces usage for the budget
  * guard.
  */
-export function createOpenaiCompat({ baseUrl, apiKey, defaultModel, price, scrubber, logSink, fetchFn = fetch, modelOverride, name }) {
+export function createOpenaiCompat({
+  baseUrl,
+  apiKey,
+  defaultModel,
+  price,
+  scrubber,
+  logSink,
+  fetchFn = fetch,
+  modelOverride,
+  name,
+  callTimeoutMs = 120_000,
+  transcriptBodyBytes = 2048,
+  retryBaseMs = 1000
+}) {
   const model = () => modelOverride || defaultModel;
 
   async function log(entry) {
@@ -21,9 +34,24 @@ export function createOpenaiCompat({ baseUrl, apiKey, defaultModel, price, scrub
   return {
     name: name ?? 'openai-compat',
     price: price ?? { in: 0.70, out: 2.10 },
-    async chat({ messages, tools, meta = {} }) {
+    async chat({ messages, tools, meta = {}, signal }) {
       const clean = scrubber ? scrubber.scrubMessages(messages) : messages;
-      await log({ kind: 'openai-compat.outbound', model: model(), meta, messageCount: clean.length, messages: clean });
+      const loggedMessages = clean.map((m) => {
+        const raw = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
+        const chars = raw.length;
+        const estTokens = Math.ceil(chars / 4);
+        const trunc = truncateBytes(raw, transcriptBodyBytes);
+        return {
+          role: m.role,
+          chars,
+          estTokens,
+          truncated: trunc.truncated,
+          content: trunc.text,
+          ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+          ...(m.tool_calls ? { toolCallsCount: m.tool_calls.length } : {})
+        };
+      });
+      await log({ kind: 'openai-compat.outbound', model: model(), meta, messageCount: clean.length, messages: loggedMessages });
       const body = {
         model: model(),
         messages: clean,
@@ -33,6 +61,26 @@ export function createOpenaiCompat({ baseUrl, apiKey, defaultModel, price, scrub
       let lastErr = null;
       for (let attempt = 0; attempt <= 3; attempt++) {
         let res = null;
+        lastErr = null;
+        const timeoutSignal = AbortSignal.timeout(callTimeoutMs);
+        let reqSignal = timeoutSignal;
+        let cleanupAbort = null;
+        if (signal) {
+          const ac = new AbortController();
+          const onAbort = () => ac.abort(signal.reason);
+          const onTimeout = () => ac.abort(timeoutSignal.reason);
+          if (signal.aborted) ac.abort(signal.reason);
+          else if (timeoutSignal.aborted) ac.abort(timeoutSignal.reason);
+          else {
+            signal.addEventListener('abort', onAbort, { once: true });
+            timeoutSignal.addEventListener('abort', onTimeout, { once: true });
+            cleanupAbort = () => {
+              signal.removeEventListener('abort', onAbort);
+              timeoutSignal.removeEventListener('abort', onTimeout);
+            };
+          }
+          reqSignal = ac.signal;
+        }
         try {
           res = await fetchFn(`${baseUrl}/chat/completions`, {
             method: 'POST',
@@ -40,10 +88,17 @@ export function createOpenaiCompat({ baseUrl, apiKey, defaultModel, price, scrub
               'content-type': 'application/json',
               ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {})
             },
-            body: JSON.stringify(body)
+            body: JSON.stringify(body),
+            signal: reqSignal
           });
         } catch (e) {
-          lastErr = Object.assign(e, { code: 'network_error' });
+          if (e?.name === 'TimeoutError' || e?.name === 'AbortError' || timeoutSignal.aborted) {
+            lastErr = Object.assign(new Error(`provider call timed out after ${callTimeoutMs}ms`), { code: 'provider_timeout', cause: e });
+          } else {
+            lastErr = Object.assign(e, { code: 'network_error' });
+          }
+        } finally {
+          cleanupAbort?.();
         }
         if (!lastErr) {
           if (res.ok) {
@@ -66,7 +121,7 @@ export function createOpenaiCompat({ baseUrl, apiKey, defaultModel, price, scrub
           }
           if (res.status !== 429 && res.status < 500) break;
         }
-        if (attempt < 3) await sleep(1000 * 2 ** attempt);
+        if (attempt < 3) await sleep(retryBaseMs * 2 ** attempt);
       }
       throw lastErr;
     }

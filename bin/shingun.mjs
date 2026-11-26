@@ -1,4 +1,12 @@
 #!/usr/bin/env node
+const nodeMajor = Number(process.versions.node.split('.')[0]);
+if (nodeMajor < 18) {
+  process.stderr.write(`shingun: Node.js >= 18 required (running ${process.version})\n`);
+  process.exit(1);
+}
+if (nodeMajor < 20) {
+  process.stderr.write(`shingun: warning: Node.js ${process.version} is below recommended >= 20\n`);
+}
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs, { mkdir } from 'node:fs/promises';
@@ -174,7 +182,9 @@ async function main() {
       const ing = await ingestChallenge({
         source: !sourceArg ? 'none' : isArchiveUrl ? 'download' : isUrl ? 'url' : 'path',
         value: sourceArg, challengesDir, target: liveTarget,
-        challengeId: typeof args.challengeId === 'string' ? args.challengeId : undefined
+        challengeId: typeof args.challengeId === 'string' ? args.challengeId : undefined,
+        maxExtractedBytes: config.ingest?.maxExtractedBytes,
+        maxExtractedEntries: config.ingest?.maxExtractedEntries
       });
       // Operator-known challenge metadata: declared values bypass master
       // inference (triage reports source "declared") and steer personas.
@@ -289,16 +299,30 @@ async function main() {
       if (resumed.length) {
         process.stdout.write(`resumed swarms (in-flight before restart): ${resumed.join(', ')}\n`);
       }
-      const shutdown = () => {
-        srv.close().finally(() => process.exit(0));
+      let shuttingDown = false;
+      const shutdown = async () => {
+        if (shuttingDown) process.exit(1);
+        shuttingDown = true;
+        try {
+          for (const [sid, s] of orch.swarms) {
+            if (!['solved', 'stopped', 'capped'].includes(s.status)) {
+              await orch.stop(sid, 'user').catch(() => {});
+            }
+          }
+          await srv.close();
+          process.exit(0);
+        } catch {
+          process.exit(1);
+        }
       };
       process.on('SIGINT', shutdown);
       process.on('SIGTERM', shutdown);
+      if (process.platform === 'win32') process.on('SIGBREAK', shutdown);
       break;
     }
     case 'mcp': {
       const { createMcpServer } = await import('../src/mcp.mjs');
-      const mcp = createMcpServer({ orchestrator: orch, bus, workspaceDir });
+      const mcp = createMcpServer({ orchestrator: orch, bus, workspaceDir, config });
       process.on('SIGINT', () => { mcp.closeAll(); process.exit(0); });
       process.on('SIGTERM', () => { mcp.closeAll(); process.exit(0); });
       await mcp.serveStdio();

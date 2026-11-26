@@ -26,7 +26,19 @@ function httpError(code, message, detail) {
   return err;
 }
 
+const ID_RE = /^[\w-]+$/;
+function assertValidId(id, label = 'id') {
+  if (typeof id !== 'string' || !ID_RE.test(id)) {
+    throw httpError('bad_request', `${label} must be a valid identifier`);
+  }
+  return id;
+}
+
 function readJsonBody(req, capBytes = 262144) {
+  const cl = Number(req.headers['content-length']);
+  if (Number.isFinite(cl) && cl > capBytes) {
+    return Promise.reject(httpError('payload_too_large', `request body exceeds ${capBytes} bytes`));
+  }
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
@@ -36,8 +48,8 @@ function readJsonBody(req, capBytes = 262144) {
       size += chunk.length;
       if (size > capBytes) {
         done = true;
+        req.pause();
         reject(httpError('payload_too_large', `request body exceeds ${capBytes} bytes`));
-        req.destroy();
         return;
       }
       chunks.push(chunk);
@@ -59,6 +71,15 @@ function readJsonBody(req, capBytes = 262144) {
   });
 }
 
+function setBounded(map, key, value, max = 1024) {
+  if (map.has(key)) map.delete(key);
+  map.set(key, value);
+  if (map.size > max) {
+    const oldest = map.keys().next().value;
+    map.delete(oldest);
+  }
+}
+
 export async function startServer({
   config,
   env,
@@ -70,7 +91,7 @@ export async function startServer({
 }) {
   const challengesDir = path.join(workspaceDir, 'challenges');
   await fs.mkdir(challengesDir, { recursive: true });
-  const mcp = createMcpServer({ orchestrator, bus, workspaceDir });
+  const mcp = createMcpServer({ orchestrator, bus, workspaceDir, config });
 
   // Cockpit guard ledger: proposed-but-unconfirmed actions live here, in
   // memory only — a restart clears the queue, exactly like a human would
@@ -79,6 +100,7 @@ export async function startServer({
   const guardLedger = createGuardLedger({ config });
   const idempotencyCache = new Map();
   const executedActions = new Map();
+  const nodeSummaryCache = new Map();
   bus.subscribe((ev) => {
     if (ev?.type === 'swarm.update' && ev?.swarm && ev?.data?.final) {
       guardLedger.expireSwarm(ev.swarm);
@@ -138,6 +160,12 @@ export async function startServer({
     const host = String(req.headers.host ?? '');
     const name = host.replace(/:\d+$/, '').toLowerCase();
     return LOCAL_HOSTNAMES.has(name);
+  };
+  const ORIGIN_RE = /^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i;
+  const originAllowed = (req) => {
+    const origin = req.headers.origin;
+    if (origin === undefined) return true;
+    return ORIGIN_RE.test(String(origin));
   };
 
   // -- launch preflight ----------------------------------------------------
@@ -219,20 +247,27 @@ const DEFAULT_INGEST_MAX_BYTES = 256 * 1024 * 1024;
 
 /** Read a body as raw capped bytes (the upload posture). */
 function readRawBody(req, maxBytes) {
+  const cl = Number(req.headers['content-length']);
+  if (Number.isFinite(cl) && cl > maxBytes) {
+    return Promise.reject(httpError('ingest_too_large', `upload exceeds the ${Math.round(maxBytes / 1024 / 1024)}MB ingest cap`));
+  }
   return new Promise((resolve, reject) => {
     const chunks = [];
     let received = 0;
+    let done = false;
     req.on('data', (chunk) => {
+      if (done) return;
       received += chunk.length;
       if (received > maxBytes) {
-        req.destroy();
+        done = true;
+        req.pause();
         reject(httpError('ingest_too_large', `upload exceeds the ${Math.round(maxBytes / 1024 / 1024)}MB ingest cap`));
         return;
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', (e) => reject(e));
+    req.on('end', () => { if (!done) { done = true; resolve(Buffer.concat(chunks)); } });
+    req.on('error', (e) => { if (!done) { done = true; reject(e); } });
   });
 }
 
@@ -244,6 +279,13 @@ function readRawBody(req, maxBytes) {
     }
     const url = new URL(req.url, `http://127.0.0.1:${config.port}`);
     const pathname = url.pathname;
+
+    if ((req.method === 'POST' || req.method === 'DELETE' || req.method === 'PUT')
+      && (pathname === '/mcp' || pathname.startsWith('/api/'))
+      && !originAllowed(req)) {
+      sendJson(res, 403, { error: { code: 'origin_forbidden', message: 'cross-origin request rejected' } });
+      return;
+    }
 
     if (!authorize(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -287,6 +329,7 @@ function readRawBody(req, maxBytes) {
     if (req.method === 'GET' && segments.length === 1 && segments[0] === 'providers') {
       const providers = {};
       for (const [name, prov] of Object.entries(config.providers ?? {})) {
+        if (!prov || typeof prov !== 'object' || !prov.type) continue;
         providers[name] = {
           type: prov.type ?? null,
           baseUrl: prov.type === 'openai-compat' ? (prov.baseUrl ?? null) : null,
@@ -433,7 +476,9 @@ function readRawBody(req, maxBytes) {
         challengesDir,
         target: safeTarget,
         maxBytes: typeof body.maxBytes === 'number' && Number.isFinite(body.maxBytes) && body.maxBytes > 0
-          ? Math.min(body.maxBytes, 1024 * 1024 * 1024) : undefined
+          ? Math.min(body.maxBytes, 1024 * 1024 * 1024) : undefined,
+        maxExtractedBytes: config.ingest?.maxExtractedBytes,
+        maxExtractedEntries: config.ingest?.maxExtractedEntries
       });
       const chDir = path.join(challengesDir, ing.challengeId);
       await writeJson(path.join(chDir, 'challenge.json'), {
@@ -453,13 +498,13 @@ function readRawBody(req, maxBytes) {
         ...(uploadInfo ? { uploadedBytes: uploadInfo.bytes, filename: uploadInfo.filename } : {}) };
       const resHeaders = { Location: `/api/v1/challenges/${ing.challengeId}` };
       if (idemKey) {
-        idempotencyCache.set(idemKey, { status: 201, body: resBody, headers: resHeaders });
+        setBounded(idempotencyCache, idemKey, { status: 201, body: resBody, headers: resHeaders });
       }
       return sendJson(res, 201, resBody, resHeaders);
     }
 
     if (req.method === 'GET' && segments.length === 2 && segments[0] === 'challenges') {
-      const challengeId = segments[1];
+      const challengeId = assertValidId(segments[1], 'challengeId');
       const metaFile = path.join(challengesDir, challengeId, 'challenge.json');
       const meta = await fs.readFile(metaFile, 'utf8')
         .then((t) => JSON.parse(t))
@@ -469,12 +514,12 @@ function readRawBody(req, maxBytes) {
     }
 
     if (req.method === 'POST' && segments.length === 3 && segments[0] === 'challenges' && (segments[2] === 'swarms' || segments[2] === 'swarm')) {
+      const challengeId = assertValidId(segments[1], 'challengeId');
       const idemKey = req.headers['idempotency-key'];
       if (idemKey && idempotencyCache.has(idemKey)) {
         const cached = idempotencyCache.get(idemKey);
         return sendJson(res, cached.status, cached.body, cached.headers);
       }
-      const challengeId = segments[1];
       const body = await readJsonBody(req);
       const chDir = path.join(challengesDir, challengeId);
       const metaFile = path.join(chDir, 'challenge.json');
@@ -520,7 +565,7 @@ function readRawBody(req, maxBytes) {
       const resBody = { swarmId };
       const resHeaders = { Location: `/api/v1/swarms/${swarmId}` };
       if (idemKey) {
-        idempotencyCache.set(idemKey, { status: 201, body: resBody, headers: resHeaders });
+        setBounded(idempotencyCache, idemKey, { status: 201, body: resBody, headers: resHeaders });
       }
       return sendJson(res, 201, resBody, resHeaders);
     }
@@ -528,6 +573,7 @@ function readRawBody(req, maxBytes) {
     if (segments[0] === 'swarms') {
       const swarmId = segments[1];
       if (!swarmId) throw httpError('not_found', `no route for ${req.method} ${pathname}`);
+      assertValidId(swarmId, 'swarmId');
 
       if (req.method === 'GET' && segments.length === 2) {
         const rec = await locateSwarm(challengesDir, swarmId);
@@ -572,22 +618,24 @@ function readRawBody(req, maxBytes) {
       }
 
       if (req.method === 'POST' && segments.length === 5 && segments[2] === 'workers' && (segments[4] === 'messages' || segments[4] === 'message')) {
+        const workerId = assertValidId(segments[3], 'workerId');
         const body = await readJsonBody(req);
         if (typeof body.text !== 'string' || !body.text.trim()) {
           throw httpError('bad_request', 'text must be a non-empty string');
         }
-        const out = await orchestrator.steerWorker(swarmId, segments[3], body.text);
+        const out = await orchestrator.steerWorker(swarmId, workerId, body.text);
         return sendJson(res, 200, out);
       }
 
       if (req.method === 'GET' && segments.length === 5 && segments[2] === 'workers' && segments[4] === 'diff') {
+        const workerId = assertValidId(segments[3], 'workerId');
         const rec = await locateSwarm(challengesDir, swarmId);
         if (!rec) throw httpError('swarm_unknown', `unknown swarm ${swarmId}`);
         const events = await replayFile(rec.storeFile);
-        const lastDiff = [...events].reverse().find((e) => e.type === 'worker.diff' && e.worker === segments[3]);
-        const diffText = await fs.readFile(path.join(rec.chDir, 'diffs', `${segments[3]}.diff`), 'utf8').catch(() => null);
+        const lastDiff = [...events].reverse().find((e) => e.type === 'worker.diff' && e.worker === workerId);
+        const diffText = await fs.readFile(path.join(rec.chDir, 'diffs', `${workerId}.diff`), 'utf8').catch(() => null);
         if (diffText === null && !lastDiff) {
-          throw httpError('worker_unknown', `no captured diff for worker ${segments[3]}`);
+          throw httpError('worker_unknown', `no captured diff for worker ${workerId}`);
         }
         return sendJson(res, 200, {
           stats: lastDiff?.data?.stats ?? null,
@@ -651,7 +699,7 @@ function readRawBody(req, maxBytes) {
       const { action, entry } = await guardLedger.confirm(actionId);
       await orchestrator.recordExecuted({ entry, action });
       const receipt = { executed: true, actionId };
-      executedActions.set(actionId, receipt);
+      setBounded(executedActions, actionId, receipt);
       return sendJson(res, 200, receipt);
     }
 
@@ -668,15 +716,29 @@ function readRawBody(req, maxBytes) {
         const evDir = path.join(challengesDir, entry.name, 'events');
         const files = await fs.readdir(evDir).catch(() => []);
         for (const f of files.filter((x) => x.endsWith('.jsonl') && x !== 'mcp.jsonl')) {
-          const events = await replayFile(path.join(evDir, f));
-          if (!events.length) continue;
-          const lastUpdate = [...events].reverse().find((e) => e.type === 'swarm.update');
-          swarms.push({
-            id: f.replace(/\.jsonl$/, ''),
-            challenge: entry.name,
-            status: lastUpdate?.data?.status ?? 'planning',
-            flagsCount: events.filter((e) => e.type === 'flag.found').length
-          });
+          const full = path.join(evDir, f);
+          const st = await fs.stat(full).catch(() => null);
+          if (!st) continue;
+          const cached = nodeSummaryCache.get(full);
+          let summary;
+          if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+            summary = cached.summary;
+          } else {
+            const events = await replayFile(full);
+            if (!events.length) {
+              summary = null;
+            } else {
+              const lastUpdate = [...events].reverse().find((e) => e.type === 'swarm.update');
+              summary = {
+                id: f.replace(/\.jsonl$/, ''),
+                challenge: entry.name,
+                status: lastUpdate?.data?.status ?? 'planning',
+                flagsCount: events.filter((e) => e.type === 'flag.found').length
+              };
+            }
+            nodeSummaryCache.set(full, { mtimeMs: st.mtimeMs, size: st.size, summary });
+          }
+          if (summary) swarms.push(summary);
         }
       }
       return sendJson(res, 200, {
@@ -704,16 +766,27 @@ function readRawBody(req, maxBytes) {
     const code = e?.code ?? 'internal';
     if (!res.headersSent) {
       const notFound = ['swarm_unknown', 'challenge_unknown', 'worker_unknown', 'not_found', 'bundle_empty', 'action_unknown'];
-      const badRequest = ['bad_json', 'bad_request', 'payload_too_large', 'provider_key_missing', 'provider_key_invalid', 'provider_role_unconfigured'];
+      const badRequest = ['bad_json', 'bad_request', 'provider_key_missing', 'provider_key_invalid', 'provider_role_unconfigured'];
       const status = notFound.includes(code) ? 404
         : badRequest.includes(code) ? 400
+        : (code === 'payload_too_large' || code === 'ingest_too_large') ? 413
         : code === 'unauthorized' ? 401
         : code === 'bundle_not_terminal' ? 409
         : code === 'action_superseded' ? 410
         : code === 'provider_http' ? 502
         : 500;
-      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ error: { code, message: e?.message ?? String(e) } }));
+      if (status === 413) {
+        req.resume();
+        res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', Connection: 'close' });
+        res.end(JSON.stringify({ error: { code, message: e?.message ?? String(e) } }));
+        res.on('finish', () => {
+          const t = setTimeout(() => { if (!req.destroyed) req.destroy(); }, 100);
+          t.unref?.();
+        });
+      } else {
+        res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: { code, message: e?.message ?? String(e) } }));
+      }
     } else {
       res.end();
     }

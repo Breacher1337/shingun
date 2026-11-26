@@ -40,6 +40,18 @@ test('acceptance 4b: admission gate blocks under watermark, admits above', async
   // off-Linux / missing file → gate skipped (dev machines)
   const skip = await admitWorker({ config, activeWorkers: 0, sample: async () => null });
   assert.equal(skip.ok, true);
+
+  // P1-6: when meminfo is null and fallbackFreemem is true, freemem below watermark denies with watermark-freemem
+  const denied = await admitWorker({
+    config,
+    activeWorkers: 0,
+    sample: async () => null,
+    freemem: () => 256
+  });
+  assert.equal(denied.ok, false);
+  assert.equal(denied.reason, 'watermark-freemem');
+  assert.equal(denied.memAvailableMb, 256);
+
   fs.rm(dir, { recursive: true, force: true }).catch(() => {});
 });
 

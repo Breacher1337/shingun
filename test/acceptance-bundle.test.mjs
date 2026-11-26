@@ -3,9 +3,10 @@ import assert from 'node:assert';
 import fs from 'node:fs/promises';
 import zlib from 'node:zlib';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { tmpWorkspace, runCli, FIXTURE } from './helpers.mjs';
 
-const ROOT = path.resolve(import.meta.dirname, '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TEST_CONFIG = path.join(ROOT, 'test', 'fixtures', 'test-config.json');
 
 /** Minimal USTAR reader with checksum verification — the extraction proof. */

@@ -3,6 +3,7 @@ import assert from 'node:assert';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { randomBytes } from 'node:crypto';
 import { buildZip } from './fixtures/zip-fixture.mjs';
@@ -14,7 +15,7 @@ import { createOrchestrator } from '../src/orchestrator.mjs';
 import { startServer } from '../src/server.mjs';
 import { tmpWorkspace } from './helpers.mjs';
 
-const ROOT = path.resolve(import.meta.dirname, '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 // --- fixtures -----------------------------------------------------------------
 
@@ -289,6 +290,64 @@ test('api: POST /api/v1/challenges accepts a raw zip upload (the picoCTF door)',
     assert.equal(meta.sourceType, 'upload');
     assert.equal(meta.target.url, 'http://127.0.0.1:8000/c/sqli/');
     assert.equal(meta.hint, 'vigenere');
+  } finally {
+    await srv.close();
+    fs.rm(wr, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('P1-5: zip bomb exceeding maxExtractedBytes fails with ingest_too_large and server stays healthy', async () => {
+  const { deflateRawSync } = await import('node:zlib');
+  const wr = await tmpWorkspace('ingest-bomb-');
+  const loaded = await loadConfig({ file: path.join(ROOT, 'test', 'fixtures', 'test-config.json'), profile: 'low-power' });
+  const config = structuredClone(loaded.config);
+  config.roles = { master: { provider: 'mock' }, worker: { provider: 'mock' }, oracle: null };
+  config.ingest = { maxExtractedBytes: 1024 * 1024, maxExtractedEntries: 20000 };
+  const bus = createBus();
+  const orch = createOrchestrator({ config, workspaceDir: resolveWorkspace(config, wr), env: { ...loaded.env }, bus });
+  const srv = await startServer({
+    config, env: { ...loaded.env }, orchestrator: orch, bus,
+    workspaceDir: wr, envFile: path.join(wr, '.env'),
+    configFile: path.join(wr, 'config.json')
+  });
+  await srv.listen(0);
+  const base = `http://127.0.0.1:${srv.server.address().port}`;
+
+  // Build a zip with a 5 MB deflated entry (compresses to ~5 KB)
+  const raw = Buffer.alloc(5 * 1024 * 1024, 0x41);
+  const comp = deflateRawSync(raw);
+  const nameBuf = Buffer.from('bomb.bin', 'utf8');
+  const hdr = Buffer.alloc(30);
+  hdr.writeUInt32LE(0x04034b50, 0);
+  hdr.writeUInt16LE(20, 4);
+  hdr.writeUInt16LE(0, 6);
+  hdr.writeUInt16LE(8, 8);
+  hdr.writeUInt32LE(0, 14); // CRC irrelevant since maxOutputLength trips first
+  hdr.writeUInt32LE(comp.length, 18);
+  hdr.writeUInt32LE(raw.length, 22);
+  hdr.writeUInt16LE(nameBuf.length, 26);
+  const bombZip = Buffer.concat([hdr, nameBuf, comp]);
+
+  try {
+    const res = await fetch(`${base}/api/v1/challenges`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/zip', 'x-shingun-filename': 'bomb.zip' },
+      body: bombZip
+    });
+    assert.equal(res.status, 413);
+    const body = await res.json();
+    assert.equal(body.error.code, 'ingest_too_large');
+    const leftover = await fs.readdir(path.join(wr, 'challenges'));
+    assert.equal(leftover.length, 0, 'failed ingest must not leave empty challenge directory');
+
+    // Follow-up valid ingest succeeds on the same server instance
+    const okZip = buildZip([['ok.txt', 'hello\n']]);
+    const ok = await fetch(`${base}/api/v1/challenges`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/zip', 'x-shingun-filename': 'ok.zip' },
+      body: okZip
+    });
+    assert.equal(ok.status, 201);
   } finally {
     await srv.close();
     fs.rm(wr, { recursive: true, force: true }).catch(() => {});

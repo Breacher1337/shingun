@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import timers from 'node:timers';
 import { loadConfig, resolveWorkspace } from '../src/config.mjs';
 import { createBus } from '../src/bus.mjs';
@@ -29,7 +30,7 @@ import { tmpWorkspace } from './helpers.mjs';
  *       validation, confirm receipts, unscoped /api/events replay.
  */
 
-const ROOT = path.resolve(import.meta.dirname, '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TEST_CONFIG = path.join(ROOT, 'test', 'fixtures', 'test-config.json');
 const CHAT_FILE = path.join('console', 'chat.jsonl');
 const OUTBOUND_FILE = path.join('console', 'master.outbound.jsonl');

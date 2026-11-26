@@ -125,6 +125,7 @@ export async function runWorker({
       role: 'worker', provider: provider.name ?? 'unknown',
       ...(lane ? { lane } : {}),
       tokensIn: res.usage.tokensIn, tokensOut: res.usage.tokensOut,
+      costUsd: rec.usd,
       workerId
     });
 
